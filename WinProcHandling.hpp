@@ -30,13 +30,16 @@ namespace WinProcHandling {
 
     DWORD FindProcessId(const char* processName);
     // uintptr_t GetModuleBase(DWORD pid, const char* moduleName);
-    DWORD GetModuleBase(HANDLE hProcess, uintptr_t *const outBase);
+    DWORD GetModuleBase(HANDLE processHandle, uintptr_t *const outBase);
     DWORD GetModuleBase(DWORD pid, const char* moduleName, uintptr_t *const outBase);
     void ForEachScanProcess(
         t_ProcessInfo* const processInfo,
         void* const callbackData, bool(*callback)(void* callbackData, size_t byteIndex, uint8_t& byte)
     );
-    bool PatchMemory(HANDLE ph, LPVOID target, LPCVOID patchBytes, const SIZE_T patchSize);
-    bool FillWithNOPs(HANDLE ph, LPVOID target, const SIZE_T patchSize);
-    bool ReadMemory(HANDLE ph, LPVOID destination, LPCVOID target, const SIZE_T size);
+    int8_t FillWithNOPs(LPVOID target, const SIZE_T patchSize, const bool virtualProtect);
+    int8_t FillWithNOPs(HANDLE processHandle, LPVOID target, const SIZE_T patchSize);
+    int8_t WriteMemory(LPVOID destination, LPCVOID source, const SIZE_T size, const bool virtualProtect);
+    int8_t WriteMemory(HANDLE processHandle, LPVOID remoteDestination, LPCVOID localSource, const SIZE_T size);
+    bool ReadMemory(LPVOID destination, LPCVOID source, const SIZE_T size, const bool virtualProtect);
+    bool ReadMemory(HANDLE processHandle, LPVOID localDestination, LPCVOID remoteSource, const SIZE_T size);
 }

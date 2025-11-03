@@ -20,6 +20,7 @@
 #include <iostream>
 #include <vector>
 #include <functional>
+#include <cstring>
 
 namespace WinProcHandling {
     DWORD FindProcessId(const char* processName) {
@@ -184,92 +185,183 @@ namespace WinProcHandling {
         }
     }
 
-    bool PatchMemory(HANDLE ph, LPVOID target, LPCVOID patchBytes, const SIZE_T patchSize) {
-        // Read original bytes and save backup
-        // std::vector<BYTE> orig(patchSize);
-        // SIZE_T bytesRead = 0;
-        // if (!ReadProcessMemory(ph, target, orig.data(), patchSize, &bytesRead) || bytesRead != patchSize) {
-        //     std::cerr << "ReadProcessMemory failed. Error: " << GetLastError() << "\n";
-        //     return false;
-        // }
-        // Save backup file
-        // {
-        //     std::ofstream out("orig_bytes.bin", std::ios::binary);
-        //     if (out) out.write(reinterpret_cast<const char*>(orig.data()), orig.size());
-        // }
-        // std::cout << "Original bytes saved to orig_bytes.bin\n";
-
+/**
+ * @brief Fill a region of memory with NOPs (0x90) and
+ * optionally change the protection to PAGE_EXECUTE_READWRITE
+ * @param target Address of the region to fill with NOPs
+ * @param patchSize Size of the region to fill with NOPs
+ * @param virtualProtect If true, change protection of region to PAGE_EXECUTE_READWRITE
+ * @return 1 if successful, -1 if failed
+ * @throws std::runtime_error If VirtualProtectEx failed
+ */
+    int8_t FillWithNOPs(LPVOID target, const SIZE_T patchSize, const bool virtualProtect) {
         DWORD oldProtect = 0;
-        if (!VirtualProtectEx(ph, target, patchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        if (virtualProtect && !VirtualProtect(target, patchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             std::cerr << "VirtualProtectEx failed. Error: " << GetLastError() << "\n";
-            return 1;
+            return 0;
         }
-
-        SIZE_T written = 0;
-        if (!WriteProcessMemory(ph, target, patchBytes, patchSize, &written) || written != patchSize) {
-            std::cerr << "WriteProcessMemory failed. Error: " << GetLastError() << "\n";
-            // try restore protection
-            VirtualProtectEx(ph, target, patchSize, oldProtect, &oldProtect);
-            return 1;
-        }
+        
+        const std::vector<BYTE> nops(patchSize, 0x90); 
+        std::memcpy(target, nops.data(), patchSize);
 
         // Ensure CPU sees the change
-        if (!FlushInstructionCache(ph, target, patchSize)) {
+        int8_t result = FlushInstructionCache(GetCurrentProcess(), target, patchSize) ? 1 : -1;
+        if (result == -1) {
             std::cerr << "FlushInstructionCache failed. Error: " << GetLastError() << "\n";
         }
 
         // restore original protection
-        DWORD tmp;
-        VirtualProtectEx(ph, target, patchSize, oldProtect, &tmp);
-        
-        return true;
+        if (virtualProtect) {
+            VirtualProtect(target, patchSize, oldProtect, &oldProtect);
+        }
+
+        return result;
     }
 
-
-    bool FillWithNOPs(HANDLE ph, LPVOID target, const SIZE_T patchSize) {
+/**
+ * @brief Fills a memory block at the process with NOPs (0x90)
+ * @param processHandle Handle of the process to write to
+ * @param target Address in the process to write to
+ * @param patchSize Size of the patch to write
+ * @return FlushInstructionCacheFailed = -1, WriteMemoryFailed = 0, Success = 1
+ */
+    int8_t FillWithNOPs(HANDLE processHandle, LPVOID target, const SIZE_T patchSize) {
         DWORD oldProtect = 0;
-        if (!VirtualProtectEx(ph, target, patchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        if (!VirtualProtectEx(processHandle, target, patchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             std::cerr << "VirtualProtectEx failed. Error: " << GetLastError() << "\n";
-            return 1;
+            return 0;
         }
         
         SIZE_T totalWritten = 0;
-        for (uint8_t* address = static_cast<uint8_t*>(target); address < static_cast<uint8_t*>(target) + patchSize; address++) {
-            const uint8_t nop = 0x90;
-            SIZE_T written = 0;
-            if (!WriteProcessMemory(ph, reinterpret_cast<LPVOID>(address), &nop, 1, &written)) {
-                std::cerr << "WriteProcessMemory failed. Error: " << GetLastError() << "\n";
-                // try restore protection
-                VirtualProtectEx(ph, reinterpret_cast<LPVOID>(address), patchSize, oldProtect, &oldProtect);
-                return 1;
-            }
-            totalWritten += written;
+        const std::vector<BYTE> nops(patchSize, 0x90); 
+        if (!WriteProcessMemory(processHandle, target, nops.data(), patchSize, &totalWritten)) {
+            std::cerr << "WriteProcessMemory failed. Error: " << GetLastError() << "\n";
+            // try restore protection
+            VirtualProtectEx(processHandle, target, patchSize, oldProtect, &oldProtect);
+            return 0;
         }
         if (totalWritten != patchSize) {
             std::cerr << "totalWritten != patchSize\n";
             // try restore protection
-            VirtualProtectEx(ph, target, patchSize, oldProtect, &oldProtect);
-            return 1;
+            VirtualProtectEx(processHandle, target, patchSize, oldProtect, &oldProtect);
+            return 0;
         }
 
         // Ensure CPU sees the change
-        if (!FlushInstructionCache(ph, target, patchSize)) {
+        int8_t result = FlushInstructionCache(processHandle, target, patchSize) ? 1 : -1;
+        if (result == -1) {
             std::cerr << "FlushInstructionCache failed. Error: " << GetLastError() << "\n";
         }
 
         // restore original protection
-        DWORD tmp;
-        VirtualProtectEx(ph, target, patchSize, oldProtect, &tmp);
+        VirtualProtectEx(processHandle, target, patchSize, oldProtect, &oldProtect);
         
+        return result;
+    }
+
+/**
+ * @brief Locally writes the data from source with size, to the destination
+ * @param destination address where to write to
+ * @param source Address to where the data to write
+ * @param size Size of the data to write
+ * @return FlushInstructionCacheFailed = -1, WriteMemoryFailed = 0, Success = 1
+ */
+    int8_t WriteMemory(LPVOID destination, LPCVOID source, const SIZE_T size, const bool virtualProtect) {
+        DWORD oldProtect = 0;
+        if (virtualProtect && !VirtualProtect(destination, size, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            std::cerr << "VirtualProtectEx failed. Error: " << GetLastError() << "\n";
+            return 0;
+        }
+
+        std::memmove(destination, source, size);
+
+        // Ensure CPU sees the change
+        const int8_t result = FlushInstructionCache(GetCurrentProcess(), destination, size) ? 1 : -1; 
+        if (result == -1) {
+            std::cerr << "FlushInstructionCache failed. Error: " << GetLastError() << "\n";
+        }
+
+        if (virtualProtect) {
+            // restore original protection
+            VirtualProtect(destination, size, oldProtect, &oldProtect);
+        }
+
+        return result;
+    }
+
+/**
+ * @brief Writes localSource to remoteDestination in processHandle
+ * @param processHandle Handle of the process to write to
+ * @param remoteDestination Address in the process to write to
+ * @param localSource Address of the local data to write
+ * @param size Size of the data to write
+ * @return FlushInstructionCacheFailed = -1, WriteMemoryFailed = 0, Success = 1
+ */
+    int8_t WriteMemory(HANDLE processHandle, LPVOID remoteDestination, LPCVOID localSource, const SIZE_T size) {
+        DWORD oldProtect = 0;
+        if (!VirtualProtectEx(processHandle, remoteDestination, size, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            std::cerr << "VirtualProtectEx failed. Error: " << GetLastError() << "\n";
+            return 0;
+        }
+
+        SIZE_T written = 0;
+        if (!WriteProcessMemory(processHandle, remoteDestination, localSource, size, &written) || written != size) {
+            std::cerr << "WriteProcessMemory failed. Error: " << GetLastError() << "\n";
+            // try restore protection
+            VirtualProtectEx(processHandle, remoteDestination, size, oldProtect, &oldProtect);
+            return 0;
+        }
+
+        // Ensure CPU sees the change
+        const int8_t result = FlushInstructionCache(processHandle, remoteDestination, size) ? 1 : -1; 
+        if (result == -1) {
+            std::cerr << "FlushInstructionCache failed. Error: " << GetLastError() << "\n";
+        }
+
+        // restore original protection
+        VirtualProtectEx(processHandle, remoteDestination, size, oldProtect, &oldProtect);
+        
+        return result;
+    }
+
+    bool ReadMemory(LPVOID destination, LPCVOID source, const SIZE_T size, const bool virtualProtect) {
+        DWORD oldProtect = 0;
+        if (virtualProtect &&!VirtualProtect(destination, size, PAGE_EXECUTE_READ, &oldProtect)) {
+            return false; // VirtualProtectEx failed
+        }
+
+        std::memmove(destination, source, size);
+
+        if (virtualProtect) {
+            // restore original protection
+            VirtualProtect(destination, size, oldProtect, &oldProtect);
+        }
+
         return true;
     }
 
-    bool ReadMemory(HANDLE ph, LPVOID destination, LPCVOID target, const SIZE_T size) {
-        SIZE_T bytesRead = 0;
-        if (!ReadProcessMemory(ph, target, destination, size, &bytesRead) || bytesRead != size) {
-            std::cerr << "ReadProcessMemory failed. Error: " << GetLastError() << "\n";
-            return false;
+/**
+ * @brief Reads remoteSource from processHandle into localDestination
+ * @param processHandle Handle of the process to read from
+ * @param localDestination Address of the local data to read into
+ * @param remoteSource Address in the process to read from
+ * @param size Size of the data to read
+ * @return false if VirtualProtectEx failed or ReadProcessMemory failed, true if successful
+ */
+    bool ReadMemory(HANDLE processHandle, LPVOID localDestination, LPCVOID remoteSource, const SIZE_T size) {
+        DWORD oldProtect = 0;
+        if (!VirtualProtectEx(processHandle, localDestination, size, PAGE_EXECUTE_READ, &oldProtect)) {
+            return false; // VirtualProtectEx failed
         }
+
+        SIZE_T bytesRead = 0;
+        if (!ReadProcessMemory(processHandle, remoteSource, localDestination, size, &bytesRead) || bytesRead != size) {
+            return false; // ReadProcessMemory failed
+        }
+
+        // restore original protection
+        VirtualProtectEx(processHandle, localDestination, size, oldProtect, &oldProtect);
+
         return true;
     }
 }
