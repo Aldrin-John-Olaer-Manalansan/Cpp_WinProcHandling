@@ -3,7 +3,7 @@
  * @Author: Aldrin John O. Manalansan (ajom)
  * @Email: aldrinjohnolaermanalansan@gmail.com
  * @Brief: Library for manipulating memory of windows processes
- * @LastUpdate: October 20, 2025
+ * @LastUpdate: November 5, 2025
  *
  * Copyright (C) 2025  Aldrin John O. Manalansan  <aldrinjohnolaermanalansan@gmail.com>
  * 
@@ -29,17 +29,21 @@ namespace WinProcHandling {
     };
 
     DWORD FindProcessId(const char* processName);
-    // uintptr_t GetModuleBase(DWORD pid, const char* moduleName);
+
     DWORD GetModuleBase(HANDLE processHandle, uintptr_t *const outBase);
     DWORD GetModuleBase(DWORD pid, const char* moduleName, uintptr_t *const outBase);
+
     void ForEachScanProcess(
         t_ProcessInfo* const processInfo,
         void* const callbackData, bool(*callback)(void* callbackData, size_t byteIndex, uint8_t& byte)
     );
-    int8_t FillWithNOPs(LPVOID target, const SIZE_T patchSize, const bool virtualProtect);
+
+    int8_t FillWithNOPs(LPVOID target, const SIZE_T patchSize, const bool virtualProtect = false);
     int8_t FillWithNOPs(HANDLE processHandle, LPVOID target, const SIZE_T patchSize);
-    int8_t WriteMemory(LPVOID destination, LPCVOID source, const SIZE_T size, const bool virtualProtect);
+
+    int8_t WriteMemory(LPVOID destination, LPCVOID source, const SIZE_T size, const bool virtualProtect = false);
     int8_t WriteMemory(HANDLE processHandle, LPVOID remoteDestination, LPCVOID localSource, const SIZE_T size);
-    bool ReadMemory(LPVOID destination, LPCVOID source, const SIZE_T size, const bool virtualProtect);
+
+    bool ReadMemory(LPVOID destination, LPCVOID source, const SIZE_T size, const bool virtualProtect = false);
     bool ReadMemory(HANDLE processHandle, LPVOID localDestination, LPCVOID remoteSource, const SIZE_T size);
 }
