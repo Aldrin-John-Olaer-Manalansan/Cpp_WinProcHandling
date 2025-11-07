@@ -15,7 +15,6 @@
 
 #include "WinProcHandling.hpp"
 
-#include <algorithm>
 #include <cstring>
 #include <functional>
 #include <iostream>

@@ -15,6 +15,10 @@
 
 #pragma once
 
+#ifndef NOMINMAX
+    #define NOMINMAX 1
+#endif
+
 #include <windows.h>
 #include <cstdint>
 
