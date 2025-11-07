@@ -15,12 +15,13 @@
 
 #include "WinProcHandling.hpp"
 
+#include <algorithm>
+#include <cstring>
+#include <functional>
+#include <iostream>
 #include <psapi.h>
 #include <tlhelp32.h>
-#include <iostream>
 #include <vector>
-#include <functional>
-#include <cstring>
 
 namespace WinProcHandling {
     struct PageProtectEntry {
