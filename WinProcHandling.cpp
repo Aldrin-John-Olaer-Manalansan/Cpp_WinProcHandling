@@ -360,6 +360,14 @@ namespace WinProcHandling {
             return false;
         }
         
+        if (mbi.State != MEM_COMMIT) {
+            return false; // region does not allow commit operations
+        }
+
+        if (mbi.Protect & c_WritableFlags) {
+            return true; // region is already writable
+        }
+        
         DWORD oldProtect;
         DWORD newProtect = (mbi.Protect & PAGE_EXECUTE) 
             ? PAGE_EXECUTE_READWRITE  // If executable, add write
@@ -380,6 +388,14 @@ namespace WinProcHandling {
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQueryEx(processHandle, address, &mbi, sizeof(mbi)) == 0) {
             return false;
+        }
+        
+        if (mbi.State != MEM_COMMIT) {
+            return false; // region does not allow commit operations
+        }
+
+        if (mbi.Protect & c_WritableFlags) {
+            return true; // region is already writable
         }
         
         DWORD oldProtect;
@@ -404,6 +420,14 @@ namespace WinProcHandling {
             return false;
         }
         
+        if (mbi.State != MEM_COMMIT) {
+            return false; // region does not allow commit operations
+        }
+
+        if (mbi.Protect & c_ReadableFlags) {
+            return true; // region is already readable
+        }
+        
         DWORD oldProtect;
         DWORD newProtect = (mbi.Protect & PAGE_EXECUTE) 
             ? PAGE_EXECUTE_READ // If executable, add read
@@ -424,6 +448,14 @@ namespace WinProcHandling {
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQueryEx(processHandle, address, &mbi, sizeof(mbi)) == 0) {
             return false;
+        }
+        
+        if (mbi.State != MEM_COMMIT) {
+            return false; // region does not allow commit operations
+        }
+
+        if (mbi.Protect & c_ReadableFlags) {
+            return true; // region is already readable
         }
         
         DWORD oldProtect;
