@@ -32,6 +32,18 @@ namespace WinProcHandling {
         size_t moduleSize;
     };
 
+    enum class e_WriteStatus : int8_t {
+        FlushInstructionCacheFailed = -1,
+        WriteMemoryFailed,
+        Success
+    };
+    
+    enum class e_VirtualProtectMode : uint8_t {
+        DontChange,
+        SafelyChange,
+        ForceChange
+    };
+
     DWORD FindProcessId(const char* processName);
 
     DWORD GetModuleBase(HANDLE processHandle, uintptr_t *const outBase);
@@ -42,12 +54,41 @@ namespace WinProcHandling {
         void* const callbackData, bool(*callback)(void* callbackData, size_t byteIndex, uint8_t& byte)
     );
 
-    int8_t FillWithNOPs(LPVOID target, const SIZE_T patchSize, const bool virtualProtect = false);
-    int8_t FillWithNOPs(HANDLE processHandle, LPVOID target, const SIZE_T patchSize);
+    e_WriteStatus FillWithNOPs(
+        LPVOID target, 
+        const SIZE_T patchSize, 
+        const e_VirtualProtectMode virtualProtectMode = e_VirtualProtectMode::DontChange,
+        const bool flushInstructionCache = true);
+    e_WriteStatus FillWithNOPs(
+        HANDLE processHandle, 
+        LPVOID target, 
+        const SIZE_T patchSize, 
+        const e_VirtualProtectMode virtualProtectMode = e_VirtualProtectMode::SafelyChange,
+        const bool flushInstructionCache = true);
 
-    int8_t WriteMemory(LPVOID destination, LPCVOID source, const SIZE_T size, const bool virtualProtect = false);
-    int8_t WriteMemory(HANDLE processHandle, LPVOID remoteDestination, LPCVOID localSource, const SIZE_T size);
+    e_WriteStatus WriteMemory(
+        LPVOID destination, 
+        LPCVOID source, 
+        const SIZE_T size, 
+        const e_VirtualProtectMode virtualProtectMode = e_VirtualProtectMode::DontChange,
+        const bool flushInstructionCache = true);
+    e_WriteStatus WriteMemory(
+        HANDLE processHandle, 
+        LPVOID remoteDestination, 
+        LPCVOID localSource, 
+        const SIZE_T size, 
+        const e_VirtualProtectMode virtualProtectMode = e_VirtualProtectMode::SafelyChange,
+        const bool flushInstructionCache = true);
 
-    bool ReadMemory(LPVOID destination, LPCVOID source, const SIZE_T size, const bool virtualProtect = false);
-    bool ReadMemory(HANDLE processHandle, LPVOID localDestination, LPCVOID remoteSource, const SIZE_T size);
+    bool ReadMemory(
+        LPVOID destination, 
+        LPCVOID source, 
+        const SIZE_T size, 
+        const e_VirtualProtectMode virtualProtectMode = e_VirtualProtectMode::DontChange);
+    bool ReadMemory(
+        HANDLE processHandle, 
+        LPVOID localDestination, 
+        LPCVOID remoteSource, 
+        const SIZE_T size, 
+        const e_VirtualProtectMode virtualProtectMode = e_VirtualProtectMode::SafelyChange);
 }
