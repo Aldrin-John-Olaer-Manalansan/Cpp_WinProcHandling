@@ -46,7 +46,8 @@ namespace WinProcHandling {
  */
     static void RestorePageProtections(std::vector<PageProtectEntry>& entries, const size_t startIndex = 0) {
         // Restore in reverse order (not strictly required but logical)
-        for (size_t i = entries.size(); i-- >= startIndex + 1;) {
+        for (size_t i = entries.size(); i >= startIndex + 1;) {
+            i--;
             auto &entry = entries[i];
             DWORD tmp;
             VirtualProtect(entry.base, entry.size, entry.oldProtect, &tmp);
@@ -65,7 +66,8 @@ namespace WinProcHandling {
  */
     static void RestorePageProtections(HANDLE processHandle, std::vector<PageProtectEntry>& entries, const size_t startIndex = 0) {
         // Restore in reverse order (not strictly required but logical)
-        for (size_t i = entries.size(); i-- >= startIndex + 1;) {
+        for (size_t i = entries.size(); i >= startIndex + 1;) {
+            i--;
             auto &entry = entries[i];
             DWORD tmp;
             VirtualProtectEx(processHandle, entry.base, entry.size, entry.oldProtect, &tmp);
@@ -88,7 +90,7 @@ namespace WinProcHandling {
         const LPVOID address, const SIZE_T size,
         std::vector<PageProtectEntry>& out
     ) {
-        const auto& patchedEntryStart = out.size();
+        const size_t patchedEntryStart = out.size();
         uintptr_t seeker = reinterpret_cast<uintptr_t>(address);
         const uintptr_t end  = seeker + size;
         while (seeker < end) {
@@ -349,6 +351,94 @@ namespace WinProcHandling {
         return true;
     }
 
+    static bool ForcedMakeAddressWritable(
+        const LPVOID address, const SIZE_T size,
+        std::vector<PageProtectEntry>& out
+    ) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(address, &mbi, sizeof(mbi)) == 0) {
+            return false;
+        }
+        
+        DWORD oldProtect;
+        DWORD newProtect = (mbi.Protect & PAGE_EXECUTE) 
+            ? PAGE_EXECUTE_READWRITE  // If executable, add write
+            : PAGE_READWRITE;         // If not executable, just write
+        
+        if (!VirtualProtect(address, size, newProtect, &oldProtect)) {
+            return false;
+        }
+        out.push_back({address, size, oldProtect});
+
+        return true;
+    }
+
+    static bool ForcedMakeAddressWritable(
+        HANDLE processHandle, const LPVOID address, const SIZE_T size,
+        std::vector<PageProtectEntry>& out
+    ) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQueryEx(processHandle, address, &mbi, sizeof(mbi)) == 0) {
+            return false;
+        }
+        
+        DWORD oldProtect;
+        DWORD newProtect = (mbi.Protect & PAGE_EXECUTE) 
+            ? PAGE_EXECUTE_READWRITE  // If executable, add write
+            : PAGE_READWRITE;         // If not executable, just write
+        
+        if (!VirtualProtectEx(processHandle, address, size, newProtect, &oldProtect)) {
+            return false;
+        }
+        out.push_back({address, size, oldProtect});
+
+        return true;
+    }
+
+    static bool ForcedMakeAddressReadable(
+        const LPVOID address, const SIZE_T size,
+        std::vector<PageProtectEntry>& out
+    ) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(address, &mbi, sizeof(mbi)) == 0) {
+            return false;
+        }
+        
+        DWORD oldProtect;
+        DWORD newProtect = (mbi.Protect & PAGE_EXECUTE) 
+            ? PAGE_EXECUTE_READ // If executable, add read
+            : PAGE_READONLY;    // If not executable, just read
+        
+        if (!VirtualProtect(address, size, newProtect, &oldProtect)) {
+            return false;
+        }
+        out.push_back({address, size, oldProtect});
+
+        return true;
+    }
+
+    static bool ForcedMakeAddressReadable(
+        HANDLE processHandle, const LPVOID address, const SIZE_T size,
+        std::vector<PageProtectEntry>& out
+    ) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQueryEx(processHandle, address, &mbi, sizeof(mbi)) == 0) {
+            return false;
+        }
+        
+        DWORD oldProtect;
+        DWORD newProtect = (mbi.Protect & PAGE_EXECUTE) 
+            ? PAGE_EXECUTE_READ // If executable, add read
+            : PAGE_READONLY;    // If not executable, just read
+        
+        if (!VirtualProtectEx(processHandle, address, size, newProtect, &oldProtect)) {
+            return false;
+        }
+        out.push_back({address, size, oldProtect});
+
+        return true;
+    }
+
 /**
  * @brief Find the process ID of a process given its name.
  * @param processName The name of the process to find.
@@ -567,11 +657,9 @@ namespace WinProcHandling {
                 return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
             }
         } else if (virtualProtectMode == e_VirtualProtectMode::ForceChange) {
-            DWORD oldProtect;
-            if (!VirtualProtect(target, patchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                return e_WriteStatus::WriteMemoryFailed; // VirtualProtectEx failed
+            if (!ForcedMakeAddressWritable(target, patchSize, patchedEntries)) {
+                return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
             }
-            patchedEntries.push_back({target, patchSize, oldProtect});
         }
         
         const std::vector<BYTE> nops(patchSize, 0x90); 
@@ -610,11 +698,9 @@ namespace WinProcHandling {
                 return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
             }
         } else if (virtualProtectMode == e_VirtualProtectMode::ForceChange) {
-            DWORD oldProtect;
-            if (!VirtualProtectEx(processHandle, target, patchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                return e_WriteStatus::WriteMemoryFailed; // VirtualProtectEx failed
+            if (!ForcedMakeAddressWritable(processHandle, target, patchSize, patchedEntries)) {
+                return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
             }
-            patchedEntries.push_back({target, patchSize, oldProtect});
         }
         
         SIZE_T bytesWritten = 0;
@@ -658,11 +744,9 @@ namespace WinProcHandling {
                 return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
             }
         } else if (virtualProtectMode == e_VirtualProtectMode::ForceChange) {
-            DWORD oldProtect;
-            if (!VirtualProtect(destination, size, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                return e_WriteStatus::WriteMemoryFailed; // VirtualProtectEx failed
+            if (!ForcedMakeAddressWritable(destination, size, patchedEntries)) {
+                return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
             }
-            patchedEntries.push_back({destination, size, oldProtect});
         }
 
         std::memmove(destination, source, size);
@@ -702,11 +786,9 @@ namespace WinProcHandling {
                 return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
             }
         } else if (virtualProtectMode == e_VirtualProtectMode::ForceChange) {
-            DWORD oldProtect;
-            if (!VirtualProtectEx(processHandle, remoteDestination, size, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                return e_WriteStatus::WriteMemoryFailed; // VirtualProtectEx failed
+            if (!ForcedMakeAddressWritable(processHandle, remoteDestination, size, patchedEntries)) {
+                return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
             }
-            patchedEntries.push_back({remoteDestination, size, oldProtect});
         }
 
         SIZE_T bytesWritten = 0;
@@ -739,16 +821,15 @@ namespace WinProcHandling {
  */
     bool ReadMemory(LPVOID destination, LPCVOID source, const SIZE_T size, const  e_VirtualProtectMode virtualProtectMode) {
         std::vector<PageProtectEntry> patchedEntries{};
+        auto nonConstSource = const_cast<LPVOID>(source);
         if (virtualProtectMode == e_VirtualProtectMode::SafelyChange) {
-            if (!MakeAddressReadable(const_cast<LPVOID>(source), size, patchedEntries)) {
+            if (!MakeAddressReadable(nonConstSource, size, patchedEntries)) {
                 return false; // MakeAddressReadable failed
             }
         } else if (virtualProtectMode == e_VirtualProtectMode::ForceChange) {
-            DWORD oldProtect;
-            if (!VirtualProtect(destination, size, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                return false; // VirtualProtectEx failed
+            if (!ForcedMakeAddressReadable(nonConstSource, size, patchedEntries)) {
+                return false; // MakeAddressReadable failed
             }
-            patchedEntries.push_back({destination, size, oldProtect});
         }
 
         std::memmove(destination, source, size);
@@ -777,16 +858,15 @@ namespace WinProcHandling {
         const  e_VirtualProtectMode virtualProtectMode
     ) {
         std::vector<PageProtectEntry> patchedEntries{};
+        auto nonConstSource = const_cast<LPVOID>(remoteSource);
         if (virtualProtectMode == e_VirtualProtectMode::SafelyChange) {
-            if (!MakeAddressReadable(processHandle, const_cast<LPVOID>(remoteSource), size, patchedEntries)) {
+            if (!MakeAddressReadable(processHandle, nonConstSource, size, patchedEntries)) {
                 return false; // MakeAddressReadable failed
             }
         } else if (virtualProtectMode == e_VirtualProtectMode::ForceChange) {
-            DWORD oldProtect;
-            if (!VirtualProtectEx(processHandle, const_cast<LPVOID>(remoteSource), size, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                return false; // VirtualProtectEx failed
+            if (!ForcedMakeAddressReadable(processHandle, nonConstSource, size, patchedEntries)) {
+                return false; // MakeAddressReadable failed
             }
-            patchedEntries.push_back({const_cast<LPVOID>(remoteSource), size, oldProtect});
         }
 
         SIZE_T bytesRead = 0;
