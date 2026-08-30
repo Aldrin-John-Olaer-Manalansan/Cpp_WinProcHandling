@@ -3,9 +3,9 @@
  * @Author: Aldrin John O. Manalansan (ajom)
  * @Email: aldrinjohnolaermanalansan@gmail.com
  * @Brief: Library for manipulating memory of windows processes
- * @LastUpdate: November 5, 2025
+ * @LastUpdate: August 29, 2026
  *
- * Copyright (C) 2025  Aldrin John O. Manalansan  <aldrinjohnolaermanalansan@gmail.com>
+ * Copyright (C) 2026  Aldrin John O. Manalansan  <aldrinjohnolaermanalansan@gmail.com>
  * 
  * This Source Code is served under Open-Source AJOM License
  * You should have received a copy of License_OS-AJOM
@@ -15,902 +15,845 @@
 
 #include "WinProcHandling.hpp"
 
+#include <algorithm>
 #include <cstring>
-#include <functional>
-#include <iostream>
+#include <limits>
 #include <psapi.h>
 #include <tlhelp32.h>
-#include <utility>
 #include <vector>
 
-#define PRINTMSGS
-
 namespace WinProcHandling {
+    /**
+     * @struct PageProtectEntry
+     * @brief Records one successful temporary page-protection change.
+     *
+     * The entry stores exactly the information required to call VirtualProtect or
+     * VirtualProtectEx again during cleanup. Keeping these records per operation
+     * prevents one WriteMemory call from accidentally sharing protection state with
+     * a later call.
+     */
     struct PageProtectEntry {
-        LPVOID base;
-        SIZE_T size;
-        DWORD oldProtect;
+        /** First byte of the range whose protection was changed. */
+        LPVOID base{};
+        /** Number of bytes covered by the protection-changing API call. */
+        SIZE_T size{};
+        /** Protection reported by the original protection-changing call. */
+        DWORD oldProtect{};
     };
 
-    constexpr DWORD c_WritableFlags = PAGE_READWRITE | PAGE_EXECUTE_READWRITE;
-    constexpr DWORD c_ReadableFlags = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-    
-/**
- * @brief Restore the original page protection for a range of entries in the given vector.
- * @param entries The vector of PageProtectEntry to restore the original protection.
- * @param startIndex The starting index of the range to restore (inclusive). Default is 0.
- * @details This function will restore the original page protection in reverse order (not strictly required but logical)
- * and erase the restored entries from the vector.
- * @note The function does not check if the restoration was successful or not. It is assumed that the restoration will always succeed.
- */
-    static void RestorePageProtections(std::vector<PageProtectEntry>& entries, const size_t startIndex = 0) {
-        // Restore in reverse order (not strictly required but logical)
-        for (size_t i = entries.size(); i >= startIndex + 1;) {
-            i--;
-            auto &entry = entries[i];
-            DWORD tmp;
-            VirtualProtect(entry.base, entry.size, entry.oldProtect, &tmp);
-        }
-        entries.erase(entries.begin() + startIndex, entries.end());
+    constexpr DWORD kBaseProtectionMask = 0xFFu;
+    constexpr DWORD kCacheModifiers = PAGE_NOCACHE | PAGE_WRITECOMBINE;
+
+    /**
+     * @brief Returns only the base protection bits from a Win32 protection value.
+     *
+     * Protection modifiers such as PAGE_GUARD are intentionally excluded from
+     * this classification step because callers handle those modifiers separately.
+     */
+    static DWORD BaseProtection(DWORD protect) noexcept {
+        return protect & kBaseProtectionMask;
     }
 
-/**
- * @brief Restore the original page protection for a range of entries in the given vector for a specific process handle.
- * @param processHandle The handle of the process to restore the page protection.
- * @param entries The vector of PageProtectEntry to restore the original protection.
- * @param startIndex The starting index of the range to restore (inclusive). Default is 0.
- * @details This function will restore the original page protection in reverse order (not strictly required but logical)
- * and erase the restored entries from the vector.
- * @note The function does not check if the restoration was successful or not. It is assumed that the restoration will always succeed.
- */
-    static void RestorePageProtections(HANDLE processHandle, std::vector<PageProtectEntry>& entries, const size_t startIndex = 0) {
-        // Restore in reverse order (not strictly required but logical)
-        for (size_t i = entries.size(); i >= startIndex + 1;) {
-            i--;
-            auto &entry = entries[i];
-            DWORD tmp;
-            VirtualProtectEx(processHandle, entry.base, entry.size, entry.oldProtect, &tmp);
+    /** @brief Returns true when the base protection permits normal reads. */
+    static bool IsReadableProtection(DWORD protect) noexcept {
+        switch (BaseProtection(protect)) {
+        case PAGE_READONLY:
+        case PAGE_READWRITE:
+        case PAGE_WRITECOPY:
+        case PAGE_EXECUTE_READ:
+        case PAGE_EXECUTE_READWRITE:
+        case PAGE_EXECUTE_WRITECOPY:
+            return true;
+        default:
+            return false;
         }
-        entries.erase(entries.begin() + startIndex, entries.end());
     }
 
-/**
- * @brief Make a memory block writable by patching the virtual protection of the pages.
- *
- * This function takes a region of memory and makes it writable by patching the virtual protection of the pages.
- * The function is useful for making memory dumps of processes that use copy-on-write memory management techniques.
- *
- * @param address Address of the memory region to make writable.
- * @param size Size of the memory region to make writable.
- * @param out Vector to store the patched page protection information.
- * @return True if the operation was successful, false otherwise.
- */
-    static bool MakeAddressWritable(
-        const LPVOID address, const SIZE_T size,
-        std::vector<PageProtectEntry>& out
-    ) {
-        const size_t patchedEntryStart = out.size();
-        uintptr_t seeker = reinterpret_cast<uintptr_t>(address);
-        const uintptr_t end  = seeker + size;
-        while (seeker < end) {
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (VirtualQuery(reinterpret_cast<LPCVOID>(seeker), &mbi, sizeof(mbi)) == 0) {
-                #ifdef PRINTMSGS
-                std::cerr << "MakeAddressWritable: VirtualQuery failed. Error: " << GetLastError() << "\n";
-                #endif
-                RestorePageProtections(out, patchedEntryStart);
-                return false; // failed to get memory info
+    /** @brief Returns true when the base protection permits normal writes. */
+    static bool IsWritableProtection(DWORD protect) noexcept {
+        switch (BaseProtection(protect)) {
+        case PAGE_READWRITE:
+        case PAGE_WRITECOPY:
+        case PAGE_EXECUTE_READWRITE:
+        case PAGE_EXECUTE_WRITECOPY:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    /** @brief Returns true when the base protection permits instruction execution. */
+    static bool IsExecutableProtection(DWORD protect) noexcept {
+        switch (BaseProtection(protect)) {
+        case PAGE_EXECUTE:
+        case PAGE_EXECUTE_READ:
+        case PAGE_EXECUTE_READWRITE:
+        case PAGE_EXECUTE_WRITECOPY:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    /**
+     * @brief Produces a writable equivalent while preserving execute/cache intent.
+     */
+    static DWORD WritableProtection(DWORD oldProtect) noexcept {
+        DWORD result = IsExecutableProtection(oldProtect)
+            ? PAGE_EXECUTE_READWRITE
+            : PAGE_READWRITE;
+        return result | (oldProtect & kCacheModifiers);
+    }
+
+    /**
+     * @brief Produces a readable equivalent while preserving execute/cache intent.
+     */
+    static DWORD ReadableProtection(DWORD oldProtect) noexcept {
+        DWORD result = IsExecutableProtection(oldProtect)
+            ? PAGE_EXECUTE_READ
+            : PAGE_READONLY;
+        return result | (oldProtect & kCacheModifiers);
+    }
+
+    /**
+     * @brief Walks every virtual-memory region intersecting a requested range.
+     *
+     * VirtualProtect/VirtualProtectEx cannot be treated as if an arbitrary request
+     * were one homogeneous allocation. This helper therefore queries each region,
+     * changes only the intersecting portion, and records successful changes.
+     *
+     * The query/protection callables allow the same algorithm to serve local and
+     * remote memory without duplicating the range-walking logic.
+     */
+    template <typename QueryFn, typename ProtectFn>
+    static bool MakeRangeAccessible(
+        LPVOID address,
+        SIZE_T size,
+        std::vector<PageProtectEntry>& out,
+        QueryFn query,
+        ProtectFn protect,
+        DWORD (*newProtection)(DWORD),
+        bool rejectGuardPages)
+    {
+        if (size == 0)
+            return true;
+        if (address == nullptr)
+            return false;
+
+        const uintptr_t rangeStart = reinterpret_cast<uintptr_t>(address);
+
+        if (size > std::numeric_limits<uintptr_t>::max() - rangeStart)
+            return false;
+
+        const uintptr_t rangeEnd = rangeStart + size;
+        uintptr_t currentAddress = rangeStart;
+
+        while (currentAddress < rangeEnd) {
+            MEMORY_BASIC_INFORMATION memoryInformation{};
+            if (query(reinterpret_cast<LPCVOID>(currentAddress), &memoryInformation, sizeof(memoryInformation)) == 0) {
+                return false;
             }
 
-            const uintptr_t regionStart = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-            const uintptr_t  regionEnd   = regionStart + mbi.RegionSize;
-
-            // clamp to our [start,end)
-            const uintptr_t patchStart = std::max(regionStart, reinterpret_cast<uintptr_t>(address));
-            const uintptr_t patchEnd   = std::min(regionEnd, end);
-
-            if (patchStart < patchEnd) { // region is in bounds
-                if ((mbi.State != MEM_COMMIT) // region does not allow commit operations
-                || (mbi.Protect & PAGE_GUARD)) { // region has PAGE_GUARD protection
-                    #ifdef PRINTMSGS
-                    std::cerr << "MakeAddressWritable: Region Protection cannot be modified\n";
-                    #endif
-                    RestorePageProtections(out, patchedEntryStart);
-                    return false; // a region cannot be read, therefore cancel the operation
-                }
-
-                if ((mbi.Protect & c_WritableFlags) == 0) { // region isn't writable yet
-                    DWORD oldProtect = 0;
-                    SIZE_T regionSizeForProtect = patchEnd - patchStart;
-                    if (!VirtualProtect(
-                        reinterpret_cast<LPVOID>(patchStart), regionSizeForProtect,
-                        (mbi.Protect & PAGE_EXECUTE) ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE, 
-                        &oldProtect))
-                    {
-                        #ifdef PRINTMSGS
-                        std::cerr << "MakeAddressWritable: VirtualProtect failed. Error: " << GetLastError() << "\n"; 
-                        #endif
-                        RestorePageProtections(out, patchedEntryStart);
-                        return false; // report failure
-                    }
-                    out.push_back({ reinterpret_cast<LPVOID>(patchStart), regionSizeForProtect, oldProtect });
-                }
+            const uintptr_t regionStart = reinterpret_cast<uintptr_t>(memoryInformation.BaseAddress);
+            if (memoryInformation.RegionSize == 0 ||
+                memoryInformation.RegionSize > std::numeric_limits<uintptr_t>::max() - regionStart) {
+                return false;
             }
 
-            seeker = regionEnd;
+            const uintptr_t regionEnd = regionStart + memoryInformation.RegionSize;
+            const uintptr_t patchStart = std::max(rangeStart, regionStart);
+            const uintptr_t patchEnd = std::min(rangeEnd, regionEnd);
+
+            if (patchStart >= patchEnd) {
+                // A successful query must make forward progress.
+                return false;
+            }
+
+            if (memoryInformation.State != MEM_COMMIT ||
+                (rejectGuardPages && (memoryInformation.Protect & PAGE_GUARD))) {
+                return false;
+            }
+
+            const DWORD originalProtection = memoryInformation.Protect;
+            const DWORD requestedProtection = newProtection(originalProtection);
+
+            if (requestedProtection != originalProtection) {
+                DWORD previousProtection = 0;
+                const SIZE_T protectedSize = static_cast<SIZE_T>(patchEnd - patchStart);
+
+                if (!protect(
+                        reinterpret_cast<LPVOID>(patchStart),
+                        protectedSize,
+                        requestedProtection,
+                        &previousProtection)) {
+                    return false;
+                }
+
+                out.push_back({
+                    reinterpret_cast<LPVOID>(patchStart),
+                    protectedSize,
+                    previousProtection
+                });
+            }
+
+            currentAddress = regionEnd;
         }
 
         return true;
     }
 
-/**
- * @brief Make a memory block found inside a remote process writable by patching the virtual protection of the pages.
- *
- * This function takes a region of memory and makes it writable by patching the virtual protection of the pages.
- * The function is useful for making memory dumps of processes that use copy-on-write memory management techniques.
- *
- * @param processHandle The handle of the process that owns the memory to make writable.
- * @param address The address of the memory region to make writable.
- * @param size The size of the memory region to make writable.
- * @param out Vector to store the patched page protection information.
- * @return True if the operation was successful, false otherwise.
- */
-    static bool MakeAddressWritable(
-        HANDLE processHandle, const LPVOID address, const SIZE_T size,
-        std::vector<PageProtectEntry>& out
-    ) {
-        const auto& patchedEntryStart = out.size();
-        uintptr_t seeker = reinterpret_cast<uintptr_t>(address);
-        const uintptr_t end  = seeker + size;
-        while (seeker < end) {
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (VirtualQueryEx(processHandle, reinterpret_cast<LPCVOID>(seeker), &mbi, sizeof(mbi)) == 0) {
-                #ifdef PRINTMSGS
-                std::cerr << "MakeAddressWritable: VirtualQueryEx failed. Error: " << GetLastError() << "\n";
-                #endif
-                RestorePageProtections(processHandle, out, patchedEntryStart);
-                return false; // failed to get memory info
+    /**
+     * @brief Restores local protections in reverse order and reports failures.
+     *
+     * Cleanup is deliberately best-effort across all recorded entries: one failed
+     * VirtualProtect call must not prevent the remaining entries from being restored.
+     */
+    static bool RestoreLocal(
+        std::vector<PageProtectEntry>& entries,
+        size_t startIndex)
+    {
+        bool allSucceeded = true;
+
+        for (size_t entryIndex = entries.size(); entryIndex > startIndex; ) {
+            --entryIndex;
+            DWORD ignoredPreviousProtection = 0;
+            if (!VirtualProtect(
+                    entries[entryIndex].base,
+                    entries[entryIndex].size,
+                    entries[entryIndex].oldProtect,
+                    &ignoredPreviousProtection))
+                allSucceeded = false;
+        }
+
+        entries.erase(entries.begin() + static_cast<std::ptrdiff_t>(startIndex), entries.end());
+        return allSucceeded;
+    }
+
+    /**
+     * @brief Restores remote protections in reverse order and reports failures.
+     */
+    static bool RestoreRemote(
+        HANDLE processHandle,
+        std::vector<PageProtectEntry>& entries,
+        size_t startIndex)
+    {
+        bool allSucceeded = true;
+
+        for (size_t i = entries.size(); i > startIndex; ) {
+            --i;
+            DWORD ignored = 0;
+            if (!VirtualProtectEx(
+                    processHandle,
+                    entries[i].base,
+                    entries[i].size,
+                    entries[i].oldProtect,
+                    &ignored)) {
+                allSucceeded = false;
             }
-
-            const uintptr_t regionStart = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-            const uintptr_t  regionEnd   = regionStart + mbi.RegionSize;
-
-            // clamp to our [start,end)
-            const uintptr_t patchStart = std::max(regionStart, reinterpret_cast<uintptr_t>(address));
-            const uintptr_t patchEnd   = std::min(regionEnd, end);
-
-            if (patchStart < patchEnd) { // region is in bounds
-                if ((mbi.State != MEM_COMMIT) // region does not allow commit operations
-                || (mbi.Protect & PAGE_GUARD)) { // region has PAGE_GUARD protection
-                    #ifdef PRINTMSGS
-                    std::cerr << "MakeAddressWritable: Region Protection cannot be modified\n";
-                    #endif
-                    RestorePageProtections(processHandle, out, patchedEntryStart);
-                    return false; // a region cannot be read, therefore cancel the operation
-                }
-
-                if ((mbi.Protect & c_WritableFlags) == 0) { // region isn't writable yet
-                    DWORD oldProtect = 0;
-                    SIZE_T regionSizeForProtect = patchEnd - patchStart;
-                    if (!VirtualProtectEx(
-                        processHandle, reinterpret_cast<LPVOID>(patchStart), regionSizeForProtect,
-                        (mbi.Protect & PAGE_EXECUTE) ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE, 
-                        &oldProtect))
-                    {
-                        #ifdef PRINTMSGS
-                        std::cerr << "MakeAddressWritable: VirtualProtectEx failed. Error: " << GetLastError() << "\n"; 
-                        #endif
-                        RestorePageProtections(processHandle, out, patchedEntryStart);
-                        return false; // report failure
-                    }
-                    out.push_back({ reinterpret_cast<LPVOID>(patchStart), regionSizeForProtect, oldProtect });
-                }
-            }
-
-            seeker = regionEnd;
         }
 
-        return true;
+        entries.erase(entries.begin() + static_cast<std::ptrdiff_t>(startIndex), entries.end());
+        return allSucceeded;
     }
 
-/**
- * @brief Make a region of memory readable.
- * @details This function makes a region of memory readable by changing the protection flags of the memory region.
- *          It iterates over all the memory regions in the given range and, if the region is not readable, it changes the protection flags
- *          to make it readable. It records the original protection flags of the regions in the given out vector so that they can be restored later.
- * @param address The start address of the memory region to make readable.
- * @param size The size of the memory region to make readable.
- * @param out A vector to store the original protection flags of the regions that were made readable.
- * @return true on success, false on failure.
- */
-    static bool MakeAddressReadable(
-        const LPVOID address, const SIZE_T size,
-        std::vector<PageProtectEntry>& out
-    ) {
-        const auto& patchedEntryStart = out.size();
-        uintptr_t seeker = reinterpret_cast<uintptr_t>(address);
-        const uintptr_t end  = seeker + size;
-        while (seeker < end) {
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (VirtualQuery(reinterpret_cast<LPCVOID>(seeker), &mbi, sizeof(mbi)) == 0) {
-                #ifdef PRINTMSGS
-                std::cerr << "MakeAddressReadable: VirtualQuery failed. Error: " << GetLastError() << "\n";
-                #endif
-                RestorePageProtections(out, patchedEntryStart);
-                return false; // failed to get memory info
-            }
-
-            const uintptr_t regionStart = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-            const uintptr_t  regionEnd   = regionStart + mbi.RegionSize;
-
-            // clamp to our [start,end)
-            const uintptr_t patchStart = std::max(regionStart, reinterpret_cast<uintptr_t>(address));
-            const uintptr_t patchEnd   = std::min(regionEnd, end);
-
-            if (patchStart < patchEnd) { // not out of bounds
-                if ((mbi.State != MEM_COMMIT) // region does not allow commit operations
-                || (mbi.Protect & PAGE_GUARD)) { // region has PAGE_GUARD protection
-                    #ifdef PRINTMSGS
-                    std::cerr << "MakeAddressReadable: Region Protection cannot be modified\n";
-                    #endif
-                    RestorePageProtections(out, patchedEntryStart);
-                    return false; // a region cannot be read, therefore cancel the operation
-                }
-
-                if ((mbi.Protect & c_ReadableFlags) == 0) { // region isn't readable yet
-                    DWORD oldProtect = 0;
-                    SIZE_T regionSizeForProtect = patchEnd - patchStart;
-                    if (!VirtualProtect(
-                        reinterpret_cast<LPVOID>(patchStart), regionSizeForProtect,
-                        (mbi.Protect & PAGE_EXECUTE) ? PAGE_EXECUTE_READ : PAGE_READONLY, 
-                        &oldProtect))
-                    {
-                        #ifdef PRINTMSGS
-                        std::cerr << "MakeAddressReadable: VirtualProtect failed. Error: " << GetLastError() << "\n"; 
-                        #endif
-                        RestorePageProtections(out, patchedEntryStart);
-                        return false; // report failure
-                    }
-                    out.push_back({ reinterpret_cast<LPVOID>(patchStart), regionSizeForProtect, oldProtect });
-                }
-            }
-
-            seeker = regionEnd;
-        }
-
-        return true;
+    /**
+     * @brief Makes a local memory range writable and records every protection change.
+     *
+     * This helper is the local-process counterpart of MakeRemoteWritable. It uses
+     * VirtualQuery/VirtualProtect because the target address belongs to the current
+     * process rather than a remote address space.
+     */
+    static bool MakeLocalWritable(
+        LPVOID address, SIZE_T size, std::vector<PageProtectEntry>& out)
+    {
+        return MakeRangeAccessible(
+            address, size, out,
+            [](LPCVOID queryAddress, PMEMORY_BASIC_INFORMATION memoryInformation, SIZE_T informationSize) {
+                return VirtualQuery(queryAddress, memoryInformation, informationSize);
+            },
+            [](LPVOID protectionAddress, SIZE_T protectionSize, DWORD newProtection, PDWORD oldProtection) {
+                return VirtualProtect(protectionAddress, protectionSize, newProtection, oldProtection);
+            },
+            WritableProtection,
+            true);
     }
 
-/**
- * @brief Make a region of memory inside a remote process readable.
- * @details This function makes a region of memory inside a remote process readable by changing the protection flags of the memory region.
- *          It iterates over all the memory regions in the given range and, if the region is not readable, it changes the protection flags
- *          to make it readable. It records the original protection flags of the regions in the given out vector so that they can be restored later.
- * @param processHandle The handle of the process that owns the memory to make readable.
- * @param address The start address of the memory region to make readable.
- * @param size The size of the memory region to make readable.
- * @param out A vector to store the original protection flags of the regions that were made readable.
- * @return true on success, false on failure.
- */
-    static bool MakeAddressReadable(
-        HANDLE processHandle, const LPVOID address, const SIZE_T size,
-        std::vector<PageProtectEntry>& out
-    ) {
-        const auto& patchedEntryStart = out.size();
-        uintptr_t seeker = reinterpret_cast<uintptr_t>(address);
-        const uintptr_t end  = seeker + size;
-        while (seeker < end) {
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (VirtualQueryEx(processHandle, reinterpret_cast<LPCVOID>(seeker), &mbi, sizeof(mbi)) == 0) {
-                #ifdef PRINTMSGS
-                std::cerr << "MakeAddressReadable: VirtualQueryEx failed. Error: " << GetLastError() << "\n";
-                #endif
-                RestorePageProtections(processHandle, out, patchedEntryStart);
-                return false; // failed to get memory info
-            }
+    /**
+     * @brief Makes a remote memory range writable and records its original protections.
+     *
+     * @param processHandle Handle of the process whose address space is changed.
+     * @param address First byte of the requested range.
+     * @param size Number of requested bytes.
+     * @param out Receives each successful protection change for later restoration.
+     * @param rejectGuardPages If true, PAGE_GUARD regions are rejected.
+     */
+    static bool MakeRemoteWritable(
+        HANDLE processHandle, LPVOID address, SIZE_T size,
+        std::vector<PageProtectEntry>& out,
+        bool rejectGuardPages)
+    {
+        if (processHandle == nullptr || processHandle == INVALID_HANDLE_VALUE)
+            return false;
 
-            const uintptr_t regionStart = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-            const uintptr_t  regionEnd   = regionStart + mbi.RegionSize;
-
-            // clamp to our [start,end)
-            const uintptr_t patchStart = std::max(regionStart, reinterpret_cast<uintptr_t>(address));
-            const uintptr_t patchEnd   = std::min(regionEnd, end);
-
-            if (patchStart < patchEnd) { // not out of bounds
-                if ((mbi.State != MEM_COMMIT) // region does not allow commit operations
-                || (mbi.Protect & PAGE_GUARD)) { // region has PAGE_GUARD protection
-                    #ifdef PRINTMSGS
-                    std::cerr << "MakeAddressReadable: Region Protection cannot be modified\n";
-                    #endif
-                    RestorePageProtections(processHandle, out, patchedEntryStart);
-                    return false; // a region cannot be read, therefore cancel the operation
-                }
-
-                if ((mbi.Protect & c_ReadableFlags) == 0) { // region isn't readable yet
-                    DWORD oldProtect = 0;
-                    SIZE_T regionSizeForProtect = patchEnd - patchStart;
-                    if (!VirtualProtectEx(
-                        processHandle, reinterpret_cast<LPVOID>(patchStart), regionSizeForProtect,
-                        (mbi.Protect & PAGE_EXECUTE) ? PAGE_EXECUTE_READ : PAGE_READONLY, 
-                        &oldProtect))
-                    {
-                        #ifdef PRINTMSGS
-                        std::cerr << "MakeAddressReadable: VirtualProtectEx failed. Error: " << GetLastError() << "\n"; 
-                        #endif
-                        RestorePageProtections(processHandle, out, patchedEntryStart);
-                        return false; // report failure
-                    }
-                    out.push_back({ reinterpret_cast<LPVOID>(patchStart), regionSizeForProtect, oldProtect });
-                }
-            }
-
-            seeker = regionEnd;
-        }
-
-        return true;
+        return MakeRangeAccessible(
+            address, size, out,
+            [processHandle](LPCVOID queryAddress, PMEMORY_BASIC_INFORMATION memoryInformation, SIZE_T informationSize) {
+                return VirtualQueryEx(processHandle, queryAddress, memoryInformation, informationSize);
+            },
+            [processHandle](LPVOID protectionAddress, SIZE_T protectionSize, DWORD newProtection, PDWORD oldProtection) {
+                return VirtualProtectEx(processHandle, protectionAddress, protectionSize, newProtection, oldProtection);
+            },
+            WritableProtection,
+            rejectGuardPages);
     }
 
-    static bool ForcedMakeAddressWritable(
-        const LPVOID address, const SIZE_T size,
-        std::vector<PageProtectEntry>& out
-    ) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(address, &mbi, sizeof(mbi)) == 0) {
-            return false;
-        }
-        
-        if (mbi.State != MEM_COMMIT) {
-            return false; // region does not allow commit operations
-        }
-
-        if (mbi.Protect & c_WritableFlags) {
-            return true; // region is already writable
-        }
-        
-        DWORD oldProtect;
-        DWORD newProtect = (mbi.Protect & PAGE_EXECUTE) 
-            ? PAGE_EXECUTE_READWRITE  // If executable, add write
-            : PAGE_READWRITE;         // If not executable, just write
-        
-        if (!VirtualProtect(address, size, newProtect, &oldProtect)) {
-            return false;
-        }
-        out.push_back({address, size, oldProtect});
-
-        return true;
+    /**
+     * @brief Makes a local memory range readable and records every protection change.
+     */
+    static bool MakeLocalReadable(
+        LPVOID address, SIZE_T size, std::vector<PageProtectEntry>& out)
+    {
+        return MakeRangeAccessible(
+            address, size, out,
+            [](LPCVOID queryAddress, PMEMORY_BASIC_INFORMATION memoryInformation, SIZE_T informationSize) {
+                return VirtualQuery(queryAddress, memoryInformation, informationSize);
+            },
+            [](LPVOID protectionAddress, SIZE_T protectionSize, DWORD newProtection, PDWORD oldProtection) {
+                return VirtualProtect(protectionAddress, protectionSize, newProtection, oldProtection);
+            },
+            ReadableProtection,
+            true);
     }
 
-    static bool ForcedMakeAddressWritable(
-        HANDLE processHandle, const LPVOID address, const SIZE_T size,
-        std::vector<PageProtectEntry>& out
-    ) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQueryEx(processHandle, address, &mbi, sizeof(mbi)) == 0) {
+    /**
+     * @brief Makes a remote memory range readable and records its original protections.
+     *
+     * @param processHandle Handle of the target process.
+     * @param address First byte of the requested range.
+     * @param size Number of requested bytes.
+     * @param out Receives successful protection changes.
+     * @param rejectGuardPages Whether PAGE_GUARD should be rejected.
+     */
+    static bool MakeRemoteReadable(
+        HANDLE processHandle, LPVOID address, SIZE_T size,
+        std::vector<PageProtectEntry>& out,
+        bool rejectGuardPages)
+    {
+        if (processHandle == nullptr || processHandle == INVALID_HANDLE_VALUE)
             return false;
-        }
-        
-        if (mbi.State != MEM_COMMIT) {
-            return false; // region does not allow commit operations
-        }
 
-        if (mbi.Protect & c_WritableFlags) {
-            return true; // region is already writable
-        }
-        
-        DWORD oldProtect;
-        DWORD newProtect = (mbi.Protect & PAGE_EXECUTE) 
-            ? PAGE_EXECUTE_READWRITE  // If executable, add write
-            : PAGE_READWRITE;         // If not executable, just write
-        
-        if (!VirtualProtectEx(processHandle, address, size, newProtect, &oldProtect)) {
-            return false;
-        }
-        out.push_back({address, size, oldProtect});
-
-        return true;
+        return MakeRangeAccessible(
+            address, size, out,
+            [processHandle](LPCVOID queryAddress, PMEMORY_BASIC_INFORMATION memoryInformation, SIZE_T informationSize) {
+                return VirtualQueryEx(processHandle, queryAddress, memoryInformation, informationSize);
+            },
+            [processHandle](LPVOID protectionAddress, SIZE_T protectionSize, DWORD newProtection, PDWORD oldProtection) {
+                return VirtualProtectEx(processHandle, protectionAddress, protectionSize, newProtection, oldProtection);
+            },
+            ReadableProtection,
+            rejectGuardPages);
     }
 
-    static bool ForcedMakeAddressReadable(
-        const LPVOID address, const SIZE_T size,
-        std::vector<PageProtectEntry>& out
-    ) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(address, &mbi, sizeof(mbi)) == 0) {
-            return false;
-        }
-        
-        if (mbi.State != MEM_COMMIT) {
-            return false; // region does not allow commit operations
-        }
-
-        if (mbi.Protect & c_ReadableFlags) {
-            return true; // region is already readable
-        }
-        
-        DWORD oldProtect;
-        DWORD newProtect = (mbi.Protect & PAGE_EXECUTE) 
-            ? PAGE_EXECUTE_READ // If executable, add read
-            : PAGE_READONLY;    // If not executable, just read
-        
-        if (!VirtualProtect(address, size, newProtect, &oldProtect)) {
-            return false;
-        }
-        out.push_back({address, size, oldProtect});
-
-        return true;
+    /**
+     * @brief Checks whether a process handle is non-null and not INVALID_HANDLE_VALUE.
+     */
+    static bool IsValidProcessHandle(HANDLE processHandle) noexcept {
+        return processHandle != nullptr && processHandle != INVALID_HANDLE_VALUE;
     }
 
-    static bool ForcedMakeAddressReadable(
-        HANDLE processHandle, const LPVOID address, const SIZE_T size,
-        std::vector<PageProtectEntry>& out
-    ) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQueryEx(processHandle, address, &mbi, sizeof(mbi)) == 0) {
-            return false;
-        }
-        
-        if (mbi.State != MEM_COMMIT) {
-            return false; // region does not allow commit operations
-        }
-
-        if (mbi.Protect & c_ReadableFlags) {
-            return true; // region is already readable
-        }
-        
-        DWORD oldProtect;
-        DWORD newProtect = (mbi.Protect & PAGE_EXECUTE) 
-            ? PAGE_EXECUTE_READ // If executable, add read
-            : PAGE_READONLY;    // If not executable, just read
-        
-        if (!VirtualProtectEx(processHandle, address, size, newProtect, &oldProtect)) {
-            return false;
-        }
-        out.push_back({address, size, oldProtect});
-
-        return true;
-    }
-
-/**
- * @brief Find the process ID of a process given its name.
- * @param processName The name of the process to find.
- * @return The process ID of the found process, or 0 if the process is not found.
- * @details This function takes a snapshot of all running processes, then iterates through the processes until it finds one with the given name. If the process is found, its process ID is returned. Otherwise, 0 is returned.
- */
+    /**
+     * @brief Creates a process snapshot and searches executable filenames.
+     *
+     * The snapshot handle is closed before the function returns. A process ID of
+     * zero is used as the failure/not-found sentinel, matching the public API.
+     */
     DWORD FindProcessId(const char* processName) {
+        if (processName == nullptr || *processName == '\0')
+            return 0;
+
         PROCESSENTRY32 pe{};
         pe.dwSize = sizeof(pe);
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snap == INVALID_HANDLE_VALUE) return 0;
-        if (Process32First(snap, &pe)) {
+
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot == INVALID_HANDLE_VALUE)
+            return 0;
+
+        DWORD result = 0;
+        if (Process32First(snapshot, &pe)) {
             do {
                 if (_stricmp(pe.szExeFile, processName) == 0) {
-                    DWORD pid = pe.th32ProcessID;
-                    CloseHandle(snap);
-                    return pid;
+                    result = pe.th32ProcessID;
+                    break;
                 }
-            } while (Process32Next(snap, &pe));
+            } while (Process32Next(snapshot, &pe));
         }
-        CloseHandle(snap);
-        return 0;
+
+        CloseHandle(snapshot);
+        return result;
     }
 
-    // uintptr_t GetModuleBase(DWORD pid, const char* moduleName) {
-    //     MODULEENTRY32 me{};
-    //     me.dwSize = sizeof(me);
-    //     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    //     if (snap == INVALID_HANDLE_VALUE) return 0;
-    //     uintptr_t base = 0;
-    //     if (Module32First(snap, &me)) {
-    //         do {
-    //             if (_stricmp(me.szModule, moduleName) == 0) {
-    //                 base = reinterpret_cast<uintptr_t>(me.modBaseAddr);
-    //                 break;
-    //             }
-    //         } while (Module32Next(snap, &me));
-    //     }
-    //     CloseHandle(snap);
-    //     return base;
-    // }
+    /**
+     * @brief Obtains the executable module information for an open process.
+     *
+     * The current-process case uses GetModuleHandle/GetModuleInformation directly;
+     * a remote process is inspected through EnumProcessModulesEx.
+     */
+    DWORD GetModuleBase(HANDLE processHandle, uintptr_t* const outBase) {
+        if (!IsValidProcessHandle(processHandle))
+            return 0;
 
-/**
- * @brief Retrieves the base address of a module in a process.
- * @param processHandle The handle of the process that owns the module.
- * @param outBase A pointer to store the base address of the module.
- * @return The size of the module's image in memory, or 0 on failure.
- * @details This function retrieves the base address of a module in a process. For local processes, it takes a fast path using GetModuleHandleA and GetModuleInformation. For remote processes, it enumerates the modules using EnumProcessModulesEx and then uses GetModuleInformation to retrieve the base address of the first module (which is usually the main module).
- */
-    DWORD GetModuleBase(HANDLE processHandle, uintptr_t *const outBase) {
-        MODULEINFO mi;
-        HMODULE hMod = nullptr;
+        MODULEINFO mi{};
 
-        // Local process fast path
         if (GetCurrentProcessId() == GetProcessId(processHandle)) {
-            hMod = GetModuleHandleA(NULL); // main module of current process
-            if (!hMod) return 0;
-            if (!GetModuleInformation(processHandle, hMod, &mi, sizeof(mi))) return 0;
-            if (outBase) *outBase = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+            HMODULE module = GetModuleHandleA(nullptr);
+            if (!module)
+                return 0;
+
+            if (!GetModuleInformation(processHandle, module, &mi, sizeof(mi)))
+                return 0;
+
+            if (outBase)
+                *outBase = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+
             return mi.SizeOfImage;
         }
 
-        // Remote process: enumerate modules (requires PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)
-        HMODULE modules[1024];
+        HMODULE modules[1024]{};
         DWORD cbNeeded = 0;
-        if (!EnumProcessModulesEx(processHandle, modules, sizeof(modules), &cbNeeded, LIST_MODULES_ALL)) {
+
+        if (!EnumProcessModulesEx(
+                processHandle, modules, sizeof(modules), &cbNeeded, LIST_MODULES_ALL)) {
             return 0;
         }
-        if (cbNeeded == 0) return 0;
-        // first returned module is usually the main module
-        hMod = modules[0];
-        if (!GetModuleInformation(processHandle, hMod, &mi, sizeof(mi))) return 0;
-        if (outBase) *outBase = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+
+        if (cbNeeded < sizeof(HMODULE))
+            return 0;
+
+        // Microsoft documents that the first module is the executable file.
+        HMODULE mainModule = modules[0];
+        if (!GetModuleInformation(processHandle, mainModule, &mi, sizeof(mi)))
+            return 0;
+
+        if (outBase)
+            *outBase = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+
         return mi.SizeOfImage;
     }
 
-/**
- * @brief Retrieves the base address of a module in a process.
- * @param pid The process ID of the process that owns the module.
- * @param moduleName The name of the module to find.
- * @param outBase A pointer to store the base address of the module.
- * @return The size of the module's image in memory, or 0 on failure.
- * @details This function retrieves the base address of a module in a process. It takes a snapshot of all the modules in the process, then iterates through the modules until it finds one with the given name. If the module is found, its base address and size are returned. Otherwise, 0 is returned.
- */
-    DWORD GetModuleBase(DWORD pid, const char* moduleName, uintptr_t *const outBase) {
+    /**
+     * @brief Enumerates process modules until the requested filename is found.
+     *
+     * ERROR_BAD_LENGTH is retried because Microsoft documents that module snapshots
+     * can transiently report that condition while the module list changes.
+     */
+    DWORD GetModuleBase(DWORD pid, const char* moduleName, uintptr_t* const outBase) {
+        if (pid == 0 || moduleName == nullptr || *moduleName == '\0')
+            return 0;
+
+        // Retry ERROR_BAD_LENGTH as documented for module snapshots.
+        HANDLE snapshot = INVALID_HANDLE_VALUE;
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            snapshot = CreateToolhelp32Snapshot(
+                TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+
+            if (snapshot != INVALID_HANDLE_VALUE)
+                break;
+
+            if (GetLastError() != ERROR_BAD_LENGTH)
+                return 0;
+        }
+
+        if (snapshot == INVALID_HANDLE_VALUE)
+            return 0;
+
         MODULEENTRY32 me{};
         me.dwSize = sizeof(me);
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-        if (snap == INVALID_HANDLE_VALUE) return 0;
-        if (Module32First(snap, &me)) {
+
+        DWORD result = 0;
+        if (Module32First(snapshot, &me)) {
             do {
                 if (_stricmp(me.szModule, moduleName) == 0) {
-                    if (outBase) *outBase = reinterpret_cast<uintptr_t>(me.modBaseAddr);
-                    CloseHandle(snap);
-                    return me.modBaseSize;
+                    if (outBase)
+                        *outBase = reinterpret_cast<uintptr_t>(me.modBaseAddr);
+                    result = me.modBaseSize;
+                    break;
                 }
-            } while (Module32Next(snap, &me));
+            } while (Module32Next(snapshot, &me));
         }
-        CloseHandle(snap);
-        return 0;
+
+        CloseHandle(snapshot);
+        return result;
     }
 
-
-/**
- * @brief Scans a process' memory in chunks and calls a callback for each byte
- * @param processInfo Information about the process to scan
- * @param callbackData Data to pass to the callback function
- * @param callback Function to call for each byte in the process' memory
- * @return void
- *
- * This function will scan the memory of the process specified by processInfo in chunks
- * of at most 64KB at a time. For each byte in the process' memory, it will call the
- * callback function and pass the callbackData and the byteIndex and the byte itself.
- * If the callback function returns true, this function will stop iterating and return.
- * If ReadProcessMemory fails for a given chunk, this function will silently skip that chunk
- * and continue to the next region.
- * The callback function is called for each byte in the process' memory that is readable.
- * The callback controls the iteration. If the callback returns true, this function will stop iterating
- */
+    /**
+     * @brief Scans the configured module range in readable chunks.
+     *
+     * VirtualQueryEx is used for each region so the scanner does not assume that an
+     * entire module has one protection value. The callback receives module-relative
+     * byte indexes and can stop the scan by returning true.
+     */
     void ForEachScanProcess(
         t_ProcessInfo* const processInfo,
-        void* const callbackData, bool(*callback)(void* callbackData, size_t byteIndex, uint8_t& byte)
-    ) {
-        constexpr SIZE_T chunkSize = 64 * 1024; // 64KB
+        void* const callbackData,
+        bool(*callback)(void* callbackData, size_t byteIndex, uint8_t& byte))
+    {
+        if (processInfo == nullptr || callback == nullptr || !IsValidProcessHandle(processInfo->handle))
+            return;
+
+        if (processInfo->moduleBase == 0 || processInfo->moduleSize == 0)
+            return;
+
+        const uintptr_t moduleEnd =
+            processInfo->moduleBase +
+            std::min<uintptr_t>(
+                processInfo->moduleSize,
+                std::numeric_limits<uintptr_t>::max() - processInfo->moduleBase);
+
+        if (processInfo->searchedOffsetFromBase >= processInfo->moduleSize)
+            return;
+
+        const uintptr_t requestedStart =
+            processInfo->moduleBase + processInfo->searchedOffsetFromBase;
+
+        const uintptr_t requestedEnd = std::min(
+            moduleEnd,
+            requestedStart + std::min<uintptr_t>(
+                processInfo->searchSize,
+                std::numeric_limits<uintptr_t>::max() - requestedStart));
+
+        constexpr SIZE_T chunkSize = 64 * 1024;
         std::vector<uint8_t> buffer;
-        SYSTEM_INFO si;
-        GetSystemInfo(&si);
+        MEMORY_BASIC_INFORMATION mbi{};
 
-        uintptr_t seeker = processInfo->moduleBase + processInfo->searchedOffsetFromBase;
-        const uintptr_t end = std::min(seeker + processInfo->searchSize, processInfo->moduleBase + processInfo->moduleSize);
-        MEMORY_BASIC_INFORMATION mbi;
-        for (;seeker < end; seeker = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize) {
-            if (VirtualQueryEx(processInfo->handle, reinterpret_cast<LPCVOID>(seeker), &mbi, sizeof(mbi)) == 0) break;
+        uintptr_t seeker = requestedStart;
 
-            uintptr_t regionBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-            uintptr_t regionEnd = regionBase + mbi.RegionSize;
-
-            // Clamp region to module's requested range
-            if (regionEnd <= processInfo->moduleBase) { seeker = regionEnd; continue; }
-            if (regionBase < processInfo->moduleBase) regionBase = processInfo->moduleBase;
-            if (regionEnd > end) regionEnd = end;
-            const SIZE_T relevantRegionSize = regionEnd - regionBase;
-
-            if (!relevantRegionSize // invalid region size
-            || (mbi.State != MEM_COMMIT) // region does not allow commit operations
-            || (mbi.Protect & PAGE_GUARD)) { // region is guarded
-                continue; // skip this region
+        while (seeker < requestedEnd) {
+            if (VirtualQueryEx(
+                    processInfo->handle,
+                    reinterpret_cast<LPCVOID>(seeker),
+                    &mbi,
+                    sizeof(mbi)) == 0) {
+                return;
             }
 
-            const DWORD newProtect = (mbi.Protect & PAGE_EXECUTE) ? PAGE_EXECUTE_READ : PAGE_READONLY;
-            SIZE_T toRead;
-            for (SIZE_T offset = 0; offset < relevantRegionSize; offset += toRead) {
-                toRead = relevantRegionSize - offset;
-                if (toRead > chunkSize) toRead = chunkSize;
-                LPVOID readAddress = reinterpret_cast<LPVOID>(regionBase + offset);
-                buffer.resize(toRead);
-                SIZE_T actuallyRead = 0;
-                
-            
-                bool isRegionReadable = mbi.Protect & c_ReadableFlags;
-                DWORD oldProtect;
-                if (!isRegionReadable
-                && !VirtualProtectEx(
-                            processInfo->handle, readAddress, toRead,
-                            newProtect, 
-                            &oldProtect)) {
-                    continue; // failed to change protection, therefore skip this region
-                }
+            const uintptr_t regionBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+            if (mbi.RegionSize == 0 ||
+                mbi.RegionSize > std::numeric_limits<uintptr_t>::max() - regionBase) {
+                return;
+            }
 
-                const bool isReadSuccess = 
-                    ReadProcessMemory(
-                        processInfo->handle,
-                        readAddress,
-                        buffer.data(),
-                        toRead,
-                        &actuallyRead)
-                    && actuallyRead;
-                
-                if (!isRegionReadable) {
-                    VirtualProtectEx(
-                        processInfo->handle, readAddress, toRead,
-                        oldProtect, &oldProtect);
-                }
+            const uintptr_t regionEnd = regionBase + mbi.RegionSize;
+            const uintptr_t readBegin = std::max(requestedStart, regionBase);
+            const uintptr_t readEnd = std::min(requestedEnd, regionEnd);
 
-                if (!isReadSuccess) {
-                    continue;
-                }
+            if (readBegin >= readEnd) {
+                if (regionEnd <= seeker)
+                    return;
+                continue;
+            }
 
-                // parse each read bytes using the callback's strategy
-                for(size_t i = 0; i < actuallyRead; i++) {
-                    if (callback(callbackData, reinterpret_cast<uintptr_t>(readAddress) - processInfo->moduleBase + i, buffer[i])) {
-                        return; // callback says we're done iterating
+            if (mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD)) {
+                const bool readable = IsReadableProtection(mbi.Protect);
+
+                for (uintptr_t current = readBegin; current < readEnd; ) {
+                    const SIZE_T remaining = static_cast<SIZE_T>(readEnd - current);
+                    const SIZE_T toRead = std::min<SIZE_T>(remaining, chunkSize);
+
+                    buffer.resize(toRead);
+                    SIZE_T actuallyRead = 0;
+                    DWORD oldProtect = 0;
+                    bool changedProtection = false;
+
+                    if (!readable) {
+                        const DWORD newProtection = ReadableProtection(mbi.Protect);
+                        if (!VirtualProtectEx(
+                                processInfo->handle,
+                                reinterpret_cast<LPVOID>(current),
+                                toRead,
+                                newProtection,
+                                &oldProtect)) {
+                            current += toRead;
+                            continue;
+                        }
+                        changedProtection = true;
                     }
+
+                    const bool readSuccess =
+                        ReadProcessMemory(
+                            processInfo->handle,
+                            reinterpret_cast<LPCVOID>(current),
+                            buffer.data(),
+                            toRead,
+                            &actuallyRead) &&
+                        actuallyRead == toRead;
+
+                    if (changedProtection) {
+                        DWORD ignored = 0;
+                        (void)VirtualProtectEx(
+                            processInfo->handle,
+                            reinterpret_cast<LPVOID>(current),
+                            toRead,
+                            oldProtect,
+                            &ignored);
+                    }
+
+                    if (readSuccess) {
+                        for (SIZE_T byteOffset = 0; byteOffset < actuallyRead; ++byteOffset) {
+                            const size_t byteIndex =
+                                static_cast<size_t>(current - processInfo->moduleBase) + byteOffset;
+                            if (callback(callbackData, byteIndex, buffer[byteOffset]))
+                                return;
+                        }
+                    }
+
+                    current += toRead;
                 }
             }
+
+            if (regionEnd <= seeker)
+                return;
         }
     }
 
-/**
- * @brief Fill a region of memory with NOPs (0x90) and
- * optionally change the protection to PAGE_EXECUTE_READWRITE
- * @param target Address of the region to fill with NOPs
- * @param patchSize Size of the region to fill with NOPs
- * @param virtualProtect If true, change protection of region to PAGE_EXECUTE_READWRITE
- * @return FlushInstructionCache Failed = -1, WriteMemory Failed = 0, Success = 1
- */
-    e_WriteStatus FillWithNOPs(
-        LPVOID target, 
-        const SIZE_T patchSize, 
-        const e_VirtualProtectMode virtualProtectMode, 
-        const bool flushInstructionCache
-    ) {
-        std::vector<PageProtectEntry> patchedEntries{};
-        if (virtualProtectMode == e_VirtualProtectMode::SafelyChange) {
-            if (!MakeAddressWritable(target, patchSize, patchedEntries)) {
-                return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
-            }
-        } else if (virtualProtectMode == e_VirtualProtectMode::ForceChange) {
-            if (!ForcedMakeAddressWritable(target, patchSize, patchedEntries)) {
-                return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
-            }
-        }
-        
-        const std::vector<BYTE> nops(patchSize, 0x90); 
-        std::memcpy(target, nops.data(), patchSize);
-
-        // Ensure CPU sees the change
-        const auto result = (!flushInstructionCache || FlushInstructionCache(GetCurrentProcess(), target, patchSize))
-            ? e_WriteStatus::Success
-            : e_WriteStatus::FlushInstructionCacheFailed;
-
-        if (std::to_underlying(virtualProtectMode)) {
-            // restore original protection
-            RestorePageProtections(patchedEntries);
-        }
-
-        return result;
-    }
-
-/**
- * @brief Fills a memory block at the process with NOPs (0x90)
- * @param processHandle Handle of the process to write to
- * @param target Address in the process to write to
- * @param patchSize Size of the patch to write
- * @return FlushInstructionCache Failed = -1, WriteProcessMemory Failed = 0, Success = 1
- */
-    e_WriteStatus FillWithNOPs(
-        HANDLE processHandle, 
-        LPVOID target, 
-        const SIZE_T patchSize, 
-        const e_VirtualProtectMode virtualProtectMode, 
-        const bool flushInstructionCache
-    ) {
-        std::vector<PageProtectEntry> patchedEntries{};
-        if (virtualProtectMode == e_VirtualProtectMode::SafelyChange) {
-            if (!MakeAddressWritable(processHandle, target, patchSize, patchedEntries)) {
-                return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
-            }
-        } else if (virtualProtectMode == e_VirtualProtectMode::ForceChange) {
-            if (!ForcedMakeAddressWritable(processHandle, target, patchSize, patchedEntries)) {
-                return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
-            }
-        }
-        
-        SIZE_T bytesWritten = 0;
-        const std::vector<BYTE> nops(patchSize, 0x90); 
-        if (!WriteProcessMemory(processHandle, target, nops.data(), patchSize, &bytesWritten) || (bytesWritten != patchSize)) {
-            // restore original protection
-            RestorePageProtections(processHandle, patchedEntries);
-            return e_WriteStatus::WriteMemoryFailed; // WriteProcessMemory failed
-        }
-
-        // Ensure CPU sees the change
-        const auto result = (!flushInstructionCache || FlushInstructionCache(processHandle, target, patchSize))
-            ? e_WriteStatus::Success
-            : e_WriteStatus::FlushInstructionCacheFailed;
-
-        if (std::to_underlying(virtualProtectMode)) {
-            // restore original protection
-            RestorePageProtections(processHandle, patchedEntries);
-        }
-        
-        return result;
-    }
-
-/**
- * @brief Locally writes the data from source with size, to the destination
- * @param destination address where to write to
- * @param source Address to where the data to write
- * @param size Size of the data to write
- * @return FlushInstructionCache Failed = -1, WriteMemory Failed = 0, Success = 1
- */
+    /**
+     * @brief Performs a local write, optional temporary protection change, cache flush,
+     * and protection restoration.
+     *
+     * The byte contents are intentionally not rolled back on failure: this function
+     * has no caller-supplied original-byte backup. Protection state is rolled back.
+     */
     e_WriteStatus WriteMemory(
-        LPVOID destination, 
-        LPCVOID source, 
-        const SIZE_T size, 
-        const e_VirtualProtectMode virtualProtectMode, 
-        const bool flushInstructionCache
-    ) {
-        std::vector<PageProtectEntry> patchedEntries{};
-        if (virtualProtectMode == e_VirtualProtectMode::SafelyChange) {
-            if (!MakeAddressWritable(destination, size, patchedEntries)) {
-                return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
-            }
-        } else if (virtualProtectMode == e_VirtualProtectMode::ForceChange) {
-            if (!ForcedMakeAddressWritable(destination, size, patchedEntries)) {
-                return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
+        LPVOID destination,
+        LPCVOID source,
+        SIZE_T size,
+        e_VirtualProtectMode virtualProtectMode,
+        bool flushInstructionCache)
+    {
+        if (size == 0)
+            return e_WriteStatus::Success;
+        if (destination == nullptr || source == nullptr)
+            return e_WriteStatus::WriteMemoryFailed;
+
+        std::vector<PageProtectEntry> changedPages;
+        const bool protectionRequested =
+            virtualProtectMode != e_VirtualProtectMode::DontChange;
+
+        if (virtualProtectMode == e_VirtualProtectMode::SafelyChange ||
+            virtualProtectMode == e_VirtualProtectMode::ForceChange) {
+            if (!MakeLocalWritable(destination, size, changedPages)) {
+                (void)RestoreLocal(changedPages, 0);
+                return e_WriteStatus::WriteMemoryFailed;
             }
         }
 
         std::memmove(destination, source, size);
 
-        // Ensure CPU sees the change
-        const auto result = (!flushInstructionCache || FlushInstructionCache(GetCurrentProcess(), destination, size))
-            ? e_WriteStatus::Success
-            : e_WriteStatus::FlushInstructionCacheFailed;
-
-        if (std::to_underlying(virtualProtectMode)) {
-            // restore original protection
-            RestorePageProtections(patchedEntries);
+        if (flushInstructionCache &&
+            !FlushInstructionCache(GetCurrentProcess(), destination, size)) {
+            if (protectionRequested) {
+                const bool restored = RestoreLocal(changedPages, 0);
+                return restored
+                    ? e_WriteStatus::FlushInstructionCacheFailed
+                    : e_WriteStatus::ProtectionRestoreFailed;
+            }
+            return e_WriteStatus::FlushInstructionCacheFailed;
         }
 
-        return result;
+        if (protectionRequested) {
+            if (!RestoreLocal(changedPages, 0))
+                return e_WriteStatus::ProtectionRestoreFailed;
+        }
+
+        return e_WriteStatus::Success;
     }
 
-/**
- * @brief Writes localSource to remoteDestination in processHandle
- * @param processHandle Handle of the process to write to
- * @param remoteDestination Address in the process to write to
- * @param localSource Address of the local data to write
- * @param size Size of the data to write
- * @return FlushInstructionCacheFailed = -1, WriteProcessMemory Failed = 0, Success = 1
- */
+    /**
+     * @brief Performs a remote write and restores all protections changed by this call.
+     *
+     * The remote write is considered complete only when WriteProcessMemory reports
+     * success and the requested byte count was written.
+     */
     e_WriteStatus WriteMemory(
-        HANDLE processHandle, 
-        LPVOID remoteDestination, 
-        LPCVOID localSource, 
-        const SIZE_T size, 
-        const  e_VirtualProtectMode virtualProtectMode,
-        const bool flushInstructionCache
-    ) {
-        std::vector<PageProtectEntry> patchedEntries{};
-        if (virtualProtectMode == e_VirtualProtectMode::SafelyChange) {
-            if (!MakeAddressWritable(processHandle, remoteDestination, size, patchedEntries)) {
-                return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
-            }
-        } else if (virtualProtectMode == e_VirtualProtectMode::ForceChange) {
-            if (!ForcedMakeAddressWritable(processHandle, remoteDestination, size, patchedEntries)) {
-                return e_WriteStatus::WriteMemoryFailed; // MakeAddressWritable failed
+        HANDLE processHandle,
+        LPVOID remoteDestination,
+        LPCVOID localSource,
+        SIZE_T size,
+        e_VirtualProtectMode virtualProtectMode,
+        bool flushInstructionCache)
+    {
+        if (!IsValidProcessHandle(processHandle))
+            return e_WriteStatus::WriteMemoryFailed;
+        if (size == 0)
+            return e_WriteStatus::Success;
+        if (remoteDestination == nullptr || localSource == nullptr)
+            return e_WriteStatus::WriteMemoryFailed;
+
+        std::vector<PageProtectEntry> changedPages;
+        const bool protectionRequested =
+            virtualProtectMode != e_VirtualProtectMode::DontChange;
+
+        if (protectionRequested) {
+            if (!MakeRemoteWritable(
+                    processHandle, remoteDestination, size, changedPages,
+                    virtualProtectMode == e_VirtualProtectMode::SafelyChange)) {
+                (void)RestoreRemote(processHandle, changedPages, 0);
+                return e_WriteStatus::WriteMemoryFailed;
             }
         }
 
         SIZE_T bytesWritten = 0;
-        if (!WriteProcessMemory(processHandle, remoteDestination, localSource, size, &bytesWritten) || (bytesWritten != size)) {
-            // restore original protection
-            RestorePageProtections(processHandle, patchedEntries);
-            return e_WriteStatus::WriteMemoryFailed; // WriteProcessMemory failed
+        const bool writeSuccess =
+            WriteProcessMemory(
+                processHandle,
+                remoteDestination,
+                localSource,
+                size,
+                &bytesWritten) &&
+            bytesWritten == size;
+
+        if (!writeSuccess) {
+            const bool restored = protectionRequested
+                ? RestoreRemote(processHandle, changedPages, 0)
+                : true;
+            return restored
+                ? e_WriteStatus::WriteMemoryFailed
+                : e_WriteStatus::ProtectionRestoreFailed;
         }
 
-        // Ensure CPU sees the change
-        const auto result = (!flushInstructionCache || FlushInstructionCache(processHandle, remoteDestination, size))
-            ? e_WriteStatus::Success
-            : e_WriteStatus::FlushInstructionCacheFailed;
-
-        if (std::to_underlying(virtualProtectMode)) {
-            // restore original protection
-            RestorePageProtections(processHandle, patchedEntries);
+        if (flushInstructionCache &&
+            !FlushInstructionCache(processHandle, remoteDestination, size)) {
+            if (protectionRequested) {
+                const bool restored = RestoreRemote(processHandle, changedPages, 0);
+                return restored
+                    ? e_WriteStatus::FlushInstructionCacheFailed
+                    : e_WriteStatus::ProtectionRestoreFailed;
+            }
+            return e_WriteStatus::FlushInstructionCacheFailed;
         }
-        
-        return result;
+
+        if (protectionRequested) {
+            if (!RestoreRemote(processHandle, changedPages, 0))
+                return e_WriteStatus::ProtectionRestoreFailed;
+        }
+
+        return e_WriteStatus::Success;
     }
 
-/**
- * @brief Copies data from source to destination in process
- * @param destination Address in the process to copy to
- * @param source Address in the process to copy from
- * @param size Size of the data to copy
- * @param virtualProtect If true, the function will attempt to make the source address readable by changing its memory protection
- * @return FlushInstructionCacheFailed = -1, ReadMemory Failed = 0, Success = 1
- */
-    bool ReadMemory(LPVOID destination, LPCVOID source, const SIZE_T size, const  e_VirtualProtectMode virtualProtectMode) {
-        std::vector<PageProtectEntry> patchedEntries{};
-        auto nonConstSource = const_cast<LPVOID>(source);
-        if (virtualProtectMode == e_VirtualProtectMode::SafelyChange) {
-            if (!MakeAddressReadable(nonConstSource, size, patchedEntries)) {
-                return false; // MakeAddressReadable failed
-            }
-        } else if (virtualProtectMode == e_VirtualProtectMode::ForceChange) {
-            if (!ForcedMakeAddressReadable(nonConstSource, size, patchedEntries)) {
-                return false; // MakeAddressReadable failed
+    e_WriteStatus FillWithNOPs(
+        LPVOID target,
+        SIZE_T patchSize,
+        e_VirtualProtectMode virtualProtectMode,
+        bool flushInstructionCache)
+    {
+        if (patchSize == 0)
+            return e_WriteStatus::Success;
+        if (target == nullptr)
+            return e_WriteStatus::WriteMemoryFailed;
+
+        std::vector<uint8_t> nops(patchSize, 0x90);
+        return WriteMemory(
+            target, nops.data(), patchSize, virtualProtectMode, flushInstructionCache);
+    }
+
+    e_WriteStatus FillWithNOPs(
+        HANDLE processHandle,
+        LPVOID target,
+        SIZE_T patchSize,
+        e_VirtualProtectMode virtualProtectMode,
+        bool flushInstructionCache)
+    {
+        if (patchSize == 0)
+            return e_WriteStatus::Success;
+        if (!IsValidProcessHandle(processHandle) || target == nullptr)
+            return e_WriteStatus::WriteMemoryFailed;
+
+        std::vector<uint8_t> nops(patchSize, 0x90);
+        return WriteMemory(
+            processHandle, target, nops.data(), patchSize,
+            virtualProtectMode, flushInstructionCache);
+    }
+
+    /**
+     * @brief Copies bytes from the current process and restores temporary protections.
+     */
+    bool ReadMemory(
+        LPVOID destination,
+        LPCVOID source,
+        SIZE_T size,
+        e_VirtualProtectMode virtualProtectMode)
+    {
+        if (size == 0)
+            return true;
+        if (destination == nullptr || source == nullptr)
+            return false;
+
+        std::vector<PageProtectEntry> changedPages;
+        const bool protectionRequested =
+            virtualProtectMode != e_VirtualProtectMode::DontChange;
+
+        if (protectionRequested) {
+            if (!MakeLocalReadable(
+                    const_cast<LPVOID>(source), size, changedPages)) {
+                (void)RestoreLocal(changedPages, 0);
+                return false;
             }
         }
 
         std::memmove(destination, source, size);
 
-        if (std::to_underlying(virtualProtectMode)) {
-            // restore original protection
-            RestorePageProtections(patchedEntries);
-        }
+        if (protectionRequested)
+            return RestoreLocal(changedPages, 0);
 
         return true;
     }
 
-/**
- * @brief Reads remoteSource from processHandle into localDestination
- * @param processHandle Handle of the process to read from
- * @param localDestination Address of the local data to read into
- * @param remoteSource Address in the process to read from
- * @param size Size of the data to read
- * @return FlushInstructionCacheFailed = -1, ReadProcessMemory Failed = 0, Success = 1
- */
+    /**
+     * @brief Reads a complete remote range and restores temporary protections even when
+     * ReadProcessMemory fails.
+     */
     bool ReadMemory(
-        HANDLE processHandle, 
-        LPVOID localDestination, 
-        LPCVOID remoteSource, 
-        const SIZE_T size, 
-        const  e_VirtualProtectMode virtualProtectMode
-    ) {
-        std::vector<PageProtectEntry> patchedEntries{};
-        auto nonConstSource = const_cast<LPVOID>(remoteSource);
-        if (virtualProtectMode == e_VirtualProtectMode::SafelyChange) {
-            if (!MakeAddressReadable(processHandle, nonConstSource, size, patchedEntries)) {
-                return false; // MakeAddressReadable failed
-            }
-        } else if (virtualProtectMode == e_VirtualProtectMode::ForceChange) {
-            if (!ForcedMakeAddressReadable(processHandle, nonConstSource, size, patchedEntries)) {
-                return false; // MakeAddressReadable failed
+        HANDLE processHandle,
+        LPVOID localDestination,
+        LPCVOID remoteSource,
+        SIZE_T size,
+        e_VirtualProtectMode virtualProtectMode)
+    {
+        if (!IsValidProcessHandle(processHandle))
+            return false;
+        if (size == 0)
+            return true;
+        if (localDestination == nullptr || remoteSource == nullptr)
+            return false;
+
+        std::vector<PageProtectEntry> changedPages;
+        const bool protectionRequested =
+            virtualProtectMode != e_VirtualProtectMode::DontChange;
+
+        if (protectionRequested) {
+            if (!MakeRemoteReadable(
+                    processHandle, const_cast<LPVOID>(remoteSource),
+                    size, changedPages,
+                    virtualProtectMode == e_VirtualProtectMode::SafelyChange)) {
+                (void)RestoreRemote(processHandle, changedPages, 0);
+                return false;
             }
         }
 
         SIZE_T bytesRead = 0;
-        if (!ReadProcessMemory(processHandle, remoteSource, localDestination, size, &bytesRead) || (bytesRead != size)) {
-            return false; // ReadProcessMemory failed
-        }
+        const bool success =
+            ReadProcessMemory(
+                processHandle,
+                remoteSource,
+                localDestination,
+                size,
+                &bytesRead) &&
+            bytesRead == size;
 
-        if (std::to_underlying(virtualProtectMode)) {
-            // restore original protection
-            RestorePageProtections(processHandle, patchedEntries);
-        }
+        const bool restored =
+            protectionRequested
+                ? RestoreRemote(processHandle, changedPages, 0)
+                : true;
 
-        return true;
+        return success && restored;
     }
-}
+} // namespace WinProcHandling
