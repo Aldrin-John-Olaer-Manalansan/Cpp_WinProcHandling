@@ -1,5 +1,5 @@
 # cmake -S . -B build -G "MinGW Makefiles"
-# cmake --build build --target run_test
+# cmake --build build --target run_tests
 
 cmake_minimum_required(VERSION 3.25)
 

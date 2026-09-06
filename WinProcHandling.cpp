@@ -3,10 +3,10 @@
  * @Author: Aldrin John O. Manalansan (ajom)
  * @Email: aldrinjohnolaermanalansan@gmail.com
  * @Brief: Library for manipulating memory of windows processes
- * @LastUpdate: August 29, 2026
+ * @LastUpdate: September 6, 2026
  *
  * Copyright (C) 2026  Aldrin John O. Manalansan  <aldrinjohnolaermanalansan@gmail.com>
- * 
+ *
  * This Source Code is served under Open-Source AJOM License
  * You should have received a copy of License_OS-AJOM
  * along with this source code. If not, see:
@@ -19,8 +19,15 @@
 #include <cstring>
 #include <limits>
 #include <psapi.h>
+#include <string>
 #include <tlhelp32.h>
 #include <vector>
+
+#ifdef IS_TESTING
+#define TESTABLE_STATIC
+#else
+#define TESTABLE_STATIC static
+#endif
 
 namespace WinProcHandling {
     /**
@@ -44,18 +51,21 @@ namespace WinProcHandling {
     constexpr DWORD kBaseProtectionMask = 0xFFu;
     constexpr DWORD kCacheModifiers = PAGE_NOCACHE | PAGE_WRITECOMBINE;
 
+    /** @brief Upper bound for full-path buffers (covers long NT paths). */
+    constexpr DWORD kMaxImagePath = 32768;
+
     /**
      * @brief Returns only the base protection bits from a Win32 protection value.
      *
      * Protection modifiers such as PAGE_GUARD are intentionally excluded from
      * this classification step because callers handle those modifiers separately.
      */
-    static DWORD BaseProtection(DWORD protect) noexcept {
+    TESTABLE_STATIC DWORD BaseProtection(DWORD protect) noexcept {
         return protect & kBaseProtectionMask;
     }
 
     /** @brief Returns true when the base protection permits normal reads. */
-    static bool IsReadableProtection(DWORD protect) noexcept {
+    TESTABLE_STATIC bool IsReadableProtection(DWORD protect) noexcept {
         switch (BaseProtection(protect)) {
         case PAGE_READONLY:
         case PAGE_READWRITE:
@@ -70,7 +80,8 @@ namespace WinProcHandling {
     }
 
     /** @brief Returns true when the base protection permits normal writes. */
-    static bool IsWritableProtection(DWORD protect) noexcept {
+    [[maybe_unused]]
+    TESTABLE_STATIC bool IsWritableProtection(DWORD protect) noexcept {
         switch (BaseProtection(protect)) {
         case PAGE_READWRITE:
         case PAGE_WRITECOPY:
@@ -83,7 +94,7 @@ namespace WinProcHandling {
     }
 
     /** @brief Returns true when the base protection permits instruction execution. */
-    static bool IsExecutableProtection(DWORD protect) noexcept {
+    TESTABLE_STATIC bool IsExecutableProtection(DWORD protect) noexcept {
         switch (BaseProtection(protect)) {
         case PAGE_EXECUTE:
         case PAGE_EXECUTE_READ:
@@ -98,7 +109,7 @@ namespace WinProcHandling {
     /**
      * @brief Produces a writable equivalent while preserving execute/cache intent.
      */
-    static DWORD WritableProtection(DWORD oldProtect) noexcept {
+    TESTABLE_STATIC DWORD WritableProtection(DWORD oldProtect) noexcept {
         DWORD result = IsExecutableProtection(oldProtect)
             ? PAGE_EXECUTE_READWRITE
             : PAGE_READWRITE;
@@ -108,7 +119,7 @@ namespace WinProcHandling {
     /**
      * @brief Produces a readable equivalent while preserving execute/cache intent.
      */
-    static DWORD ReadableProtection(DWORD oldProtect) noexcept {
+    TESTABLE_STATIC DWORD ReadableProtection(DWORD oldProtect) noexcept {
         DWORD result = IsExecutableProtection(oldProtect)
             ? PAGE_EXECUTE_READ
             : PAGE_READONLY;
@@ -119,19 +130,23 @@ namespace WinProcHandling {
      * @brief Walks every virtual-memory region intersecting a requested range.
      *
      * VirtualProtect/VirtualProtectEx cannot be treated as if an arbitrary request
-     * were one homogeneous allocation. This helper therefore queries each region,
-     * changes only the intersecting portion, and records successful changes.
+     * were one homogeneous allocation: both APIs require all pages to live inside
+     * one reserved region. This helper therefore queries each region, changes only
+     * the intersecting portion, and records successful changes.
      *
      * The query/protection callables allow the same algorithm to serve local and
-     * remote memory without duplicating the range-walking logic.
+     * remote memory without duplicating the range-walking logic. They are taken
+     * as forwarding references on purpose: production call sites pass temporary
+     * lambdas, while tests pass named mock objects and must observe the calls
+     * recorded in them afterwards (by-value deduction would log into a copy).
      */
     template <typename QueryFn, typename ProtectFn>
-    static bool MakeRangeAccessible(
+    TESTABLE_STATIC bool MakeRangeAccessible(
         LPVOID address,
         SIZE_T size,
         std::vector<PageProtectEntry>& out,
-        QueryFn query,
-        ProtectFn protect,
+        QueryFn&& query,
+        ProtectFn&& protect,
         DWORD (*newProtection)(DWORD),
         bool rejectGuardPages)
     {
@@ -208,7 +223,7 @@ namespace WinProcHandling {
      * Cleanup is deliberately best-effort across all recorded entries: one failed
      * VirtualProtect call must not prevent the remaining entries from being restored.
      */
-    static bool RestoreLocal(
+    TESTABLE_STATIC bool RestoreLocal(
         std::vector<PageProtectEntry>& entries,
         size_t startIndex)
     {
@@ -232,7 +247,7 @@ namespace WinProcHandling {
     /**
      * @brief Restores remote protections in reverse order and reports failures.
      */
-    static bool RestoreRemote(
+    TESTABLE_STATIC bool RestoreRemote(
         HANDLE processHandle,
         std::vector<PageProtectEntry>& entries,
         size_t startIndex)
@@ -263,8 +278,9 @@ namespace WinProcHandling {
      * VirtualQuery/VirtualProtect because the target address belongs to the current
      * process rather than a remote address space.
      */
-    static bool MakeLocalWritable(
-        LPVOID address, SIZE_T size, std::vector<PageProtectEntry>& out)
+    TESTABLE_STATIC bool MakeLocalWritable(
+        LPVOID address, SIZE_T size, std::vector<PageProtectEntry>& out,
+        bool rejectGuardPages)
     {
         return MakeRangeAccessible(
             address, size, out,
@@ -275,7 +291,7 @@ namespace WinProcHandling {
                 return VirtualProtect(protectionAddress, protectionSize, newProtection, oldProtection);
             },
             WritableProtection,
-            true);
+            rejectGuardPages);
     }
 
     /**
@@ -287,12 +303,14 @@ namespace WinProcHandling {
      * @param out Receives each successful protection change for later restoration.
      * @param rejectGuardPages If true, PAGE_GUARD regions are rejected.
      */
-    static bool MakeRemoteWritable(
+    TESTABLE_STATIC bool MakeRemoteWritable(
         HANDLE processHandle, LPVOID address, SIZE_T size,
         std::vector<PageProtectEntry>& out,
         bool rejectGuardPages)
     {
-        if (processHandle == nullptr || processHandle == INVALID_HANDLE_VALUE)
+        // (HANDLE)-1 is the valid current-process pseudo handle; only nullptr
+        // is rejected here. See IsValidProcessHandle for the rationale.
+        if (processHandle == nullptr)
             return false;
 
         return MakeRangeAccessible(
@@ -310,8 +328,9 @@ namespace WinProcHandling {
     /**
      * @brief Makes a local memory range readable and records every protection change.
      */
-    static bool MakeLocalReadable(
-        LPVOID address, SIZE_T size, std::vector<PageProtectEntry>& out)
+    TESTABLE_STATIC bool MakeLocalReadable(
+        LPVOID address, SIZE_T size, std::vector<PageProtectEntry>& out,
+        bool rejectGuardPages)
     {
         return MakeRangeAccessible(
             address, size, out,
@@ -322,7 +341,7 @@ namespace WinProcHandling {
                 return VirtualProtect(protectionAddress, protectionSize, newProtection, oldProtection);
             },
             ReadableProtection,
-            true);
+            rejectGuardPages);
     }
 
     /**
@@ -334,12 +353,14 @@ namespace WinProcHandling {
      * @param out Receives successful protection changes.
      * @param rejectGuardPages Whether PAGE_GUARD should be rejected.
      */
-    static bool MakeRemoteReadable(
+    TESTABLE_STATIC bool MakeRemoteReadable(
         HANDLE processHandle, LPVOID address, SIZE_T size,
         std::vector<PageProtectEntry>& out,
         bool rejectGuardPages)
     {
-        if (processHandle == nullptr || processHandle == INVALID_HANDLE_VALUE)
+        // (HANDLE)-1 is the valid current-process pseudo handle; only nullptr
+        // is rejected here. See IsValidProcessHandle for the rationale.
+        if (processHandle == nullptr)
             return false;
 
         return MakeRangeAccessible(
@@ -355,10 +376,54 @@ namespace WinProcHandling {
     }
 
     /**
-     * @brief Checks whether a process handle is non-null and not INVALID_HANDLE_VALUE.
+     * @brief Checks whether a process handle is usable for process APIs.
+     *
+     * Only nullptr is rejected. (HANDLE)-1 — numerically identical to
+     * INVALID_HANDLE_VALUE — is the documented current-process pseudo handle
+     * returned by GetCurrentProcess(): every Win32 process API (VirtualQueryEx,
+     * VirtualProtectEx, ReadProcessMemory, WriteProcessMemory, ...) resolves it
+     * to the current process, and GetProcessId reports the current PID for it.
+     * Rejecting that value would make the library diverge from the platform it
+     * wraps and internally inconsistent (remote restore paths already accepted
+     * it). Whether the caller may actually access a process is decided by the
+     * OS on every call, not by this cheap pre-check.
      */
-    static bool IsValidProcessHandle(HANDLE processHandle) noexcept {
-        return processHandle != nullptr && processHandle != INVALID_HANDLE_VALUE;
+    TESTABLE_STATIC bool IsValidProcessHandle(HANDLE processHandle) noexcept {
+        return processHandle != nullptr;
+    }
+
+    /**
+     * @brief Converts a caller-supplied ANSI (system code page) name to wide text.
+     *
+     * The public API is ANSI-only (const char*), while the ToolHelp enumeration is
+     * performed through the explicit W structures/functions so that the library
+     * compiles and behaves identically with and without -DUNICODE. CP_ACP matches
+     * the encoding the rest of the ANSI API surface assumes.
+     *
+     * @param name Null-terminated ANSI name; nullptr and empty strings fail.
+     * @param[out] out Receives the converted wide name (no terminating null).
+     * @return true when the conversion succeeded.
+     */
+    TESTABLE_STATIC bool ConvertAnsiToWideName(const char* name, std::wstring& out) {
+        out.clear();
+        if (name == nullptr || *name == '\0')
+            return false;
+
+        // Sizing pass returns the number of wide characters including the null.
+        const int requiredCharacters =
+            MultiByteToWideChar(CP_ACP, 0, name, -1, nullptr, 0);
+        if (requiredCharacters <= 1)
+            return false;
+
+        std::wstring converted(static_cast<size_t>(requiredCharacters), L'\0');
+        const int writtenCharacters = MultiByteToWideChar(
+            CP_ACP, 0, name, -1, converted.data(), requiredCharacters);
+        if (writtenCharacters != requiredCharacters)
+            return false;
+
+        converted.pop_back(); // Drop the terminating null appended for -1 input.
+        out = std::move(converted);
+        return true;
     }
 
     /**
@@ -366,12 +431,15 @@ namespace WinProcHandling {
      *
      * The snapshot handle is closed before the function returns. A process ID of
      * zero is used as the failure/not-found sentinel, matching the public API.
+     * Enumeration uses the explicit W APIs so UNICODE builds compile unchanged;
+     * name matching uses the documented case-insensitive lstrcmpiW.
      */
     DWORD FindProcessId(const char* processName) {
-        if (processName == nullptr || *processName == '\0')
+        std::wstring wideProcessName;
+        if (!ConvertAnsiToWideName(processName, wideProcessName))
             return 0;
 
-        PROCESSENTRY32 pe{};
+        PROCESSENTRY32W pe{};
         pe.dwSize = sizeof(pe);
 
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -379,13 +447,13 @@ namespace WinProcHandling {
             return 0;
 
         DWORD result = 0;
-        if (Process32First(snapshot, &pe)) {
+        if (Process32FirstW(snapshot, &pe)) {
             do {
-                if (_stricmp(pe.szExeFile, processName) == 0) {
+                if (lstrcmpiW(pe.szExeFile, wideProcessName.c_str()) == 0) {
                     result = pe.th32ProcessID;
                     break;
                 }
-            } while (Process32Next(snapshot, &pe));
+            } while (Process32NextW(snapshot, &pe));
         }
 
         CloseHandle(snapshot);
@@ -396,7 +464,13 @@ namespace WinProcHandling {
      * @brief Obtains the executable module information for an open process.
      *
      * The current-process case uses GetModuleHandle/GetModuleInformation directly;
-     * a remote process is inspected through EnumProcessModulesEx.
+     * a remote process is inspected through EnumProcessModulesEx. The enumeration
+     * buffer grows when lpcbNeeded reports that the caller's array was too small,
+     * exactly as the EnumProcessModules documentation prescribes. The main
+     * executable is identified by matching each module's full path (obtained via
+     * GetModuleFileNameExA) against the process executable path (GetModuleFileNameExA
+     * with hModule = NULL); when paths are unavailable for the handle's access
+     * rights, the first enumerated module is used as a stable de-facto fallback.
      */
     DWORD GetModuleBase(HANDLE processHandle, uintptr_t* const outBase) {
         if (!IsValidProcessHandle(processHandle))
@@ -404,7 +478,14 @@ namespace WinProcHandling {
 
         MODULEINFO mi{};
 
-        if (GetCurrentProcessId() == GetProcessId(processHandle)) {
+        // The pseudo-handle needs no access rights and always identifies the
+        // current process; GetProcessId needs PROCESS_QUERY_INFORMATION or
+        // PROCESS_QUERY_LIMITED_INFORMATION and returns 0 when they are absent.
+        const bool isCurrentProcess =
+            (processHandle == GetCurrentProcess()) ||
+            (GetCurrentProcessId() == GetProcessId(processHandle));
+
+        if (isCurrentProcess) {
             HMODULE module = GetModuleHandleA(nullptr);
             if (!module)
                 return 0;
@@ -418,19 +499,77 @@ namespace WinProcHandling {
             return mi.SizeOfImage;
         }
 
-        HMODULE modules[1024]{};
-        DWORD cbNeeded = 0;
+        // Enumerate with a growable buffer: lpcbNeeded reports the number of
+        // bytes REQUIRED for all module handles, so a result larger than the
+        // supplied cb means the list was truncated and must be re-enumerated.
+        constexpr size_t kInitialModuleCapacity = 1024;
+        constexpr int kMaxEnumerationAttempts = 3;
 
-        if (!EnumProcessModulesEx(
-                processHandle, modules, sizeof(modules), &cbNeeded, LIST_MODULES_ALL)) {
-            return 0;
+        std::vector<HMODULE> modules;
+        DWORD cbNeeded = 0;
+        size_t moduleCapacity = kInitialModuleCapacity;
+        bool enumerationSucceeded = false;
+
+        for (int attempt = 0; attempt < kMaxEnumerationAttempts; ++attempt) {
+            modules.resize(moduleCapacity);
+
+            if (!EnumProcessModulesEx(
+                    processHandle,
+                    modules.data(),
+                    static_cast<DWORD>(moduleCapacity * sizeof(HMODULE)),
+                    &cbNeeded,
+                    LIST_MODULES_ALL)) {
+                return 0;
+            }
+
+            if (cbNeeded <= moduleCapacity * sizeof(HMODULE)) {
+                enumerationSucceeded = true;
+                break;
+            }
+
+            moduleCapacity = (cbNeeded / sizeof(HMODULE)) + 64;
         }
 
-        if (cbNeeded < sizeof(HMODULE))
+        if (!enumerationSucceeded)
             return 0;
 
-        // Microsoft documents that the first module is the executable file.
-        HMODULE mainModule = modules[0];
+        const size_t moduleCount = cbNeeded / sizeof(HMODULE);
+        if (moduleCount == 0)
+            return 0;
+
+        // Identify the main executable by full-path equality against the
+        // process executable path. Fall back to the first enumerated module
+        // when paths cannot be queried (documented de-facto behavior).
+        HMODULE mainModule = nullptr;
+
+        std::vector<char> executablePath(kMaxImagePath, '\0');
+        const DWORD executablePathLength = GetModuleFileNameExA(
+            processHandle,
+            nullptr,
+            executablePath.data(),
+            kMaxImagePath);
+
+        if (executablePathLength > 0 && executablePathLength < kMaxImagePath) {
+            std::vector<char> modulePath(kMaxImagePath, '\0');
+
+            for (size_t moduleIndex = 0; moduleIndex < moduleCount; ++moduleIndex) {
+                const DWORD modulePathLength = GetModuleFileNameExA(
+                    processHandle,
+                    modules[moduleIndex],
+                    modulePath.data(),
+                    kMaxImagePath);
+
+                if (modulePathLength > 0 && modulePathLength < kMaxImagePath &&
+                    _stricmp(modulePath.data(), executablePath.data()) == 0) {
+                    mainModule = modules[moduleIndex];
+                    break;
+                }
+            }
+        }
+
+        if (mainModule == nullptr)
+            mainModule = modules[0];
+
         if (!GetModuleInformation(processHandle, mainModule, &mi, sizeof(mi)))
             return 0;
 
@@ -445,9 +584,12 @@ namespace WinProcHandling {
      *
      * ERROR_BAD_LENGTH is retried because Microsoft documents that module snapshots
      * can transiently report that condition while the module list changes.
+     * Enumeration uses the explicit W APIs so UNICODE builds compile unchanged;
+     * name matching uses the documented case-insensitive lstrcmpiW.
      */
     DWORD GetModuleBase(DWORD pid, const char* moduleName, uintptr_t* const outBase) {
-        if (pid == 0 || moduleName == nullptr || *moduleName == '\0')
+        std::wstring wideModuleName;
+        if (pid == 0 || !ConvertAnsiToWideName(moduleName, wideModuleName))
             return 0;
 
         // Retry ERROR_BAD_LENGTH as documented for module snapshots.
@@ -466,19 +608,19 @@ namespace WinProcHandling {
         if (snapshot == INVALID_HANDLE_VALUE)
             return 0;
 
-        MODULEENTRY32 me{};
+        MODULEENTRY32W me{};
         me.dwSize = sizeof(me);
 
         DWORD result = 0;
-        if (Module32First(snapshot, &me)) {
+        if (Module32FirstW(snapshot, &me)) {
             do {
-                if (_stricmp(me.szModule, moduleName) == 0) {
+                if (lstrcmpiW(me.szModule, wideModuleName.c_str()) == 0) {
                     if (outBase)
                         *outBase = reinterpret_cast<uintptr_t>(me.modBaseAddr);
                     result = me.modBaseSize;
                     break;
                 }
-            } while (Module32Next(snapshot, &me));
+            } while (Module32NextW(snapshot, &me));
         }
 
         CloseHandle(snapshot);
@@ -490,7 +632,10 @@ namespace WinProcHandling {
      *
      * VirtualQueryEx is used for each region so the scanner does not assume that an
      * entire module has one protection value. The callback receives module-relative
-     * byte indexes and can stop the scan by returning true.
+     * byte indexes and can stop the scan by returning true. Committed non-guarded
+     * regions lacking read access are temporarily made readable in the target and
+     * restored before their bytes are delivered; when a chunk read transfers only
+     * part of the requested bytes, the transferred prefix is still delivered.
      */
     void ForEachScanProcess(
         t_ProcessInfo* const processInfo,
@@ -503,17 +648,21 @@ namespace WinProcHandling {
         if (processInfo->moduleBase == 0 || processInfo->moduleSize == 0)
             return;
 
+        const uintptr_t maxAllowedmoduleOffset = std::numeric_limits<uintptr_t>::max() - processInfo->moduleBase;
+
         const uintptr_t moduleEnd =
             processInfo->moduleBase +
             std::min<uintptr_t>(
                 processInfo->moduleSize,
-                std::numeric_limits<uintptr_t>::max() - processInfo->moduleBase);
+                maxAllowedmoduleOffset);
 
-        if (processInfo->searchedOffsetFromBase >= processInfo->moduleSize)
+        if (processInfo->searchedOffsetFromBase >= maxAllowedmoduleOffset)
             return;
 
         const uintptr_t requestedStart =
-            processInfo->moduleBase + processInfo->searchedOffsetFromBase;
+            processInfo->moduleBase + std::min<uintptr_t>(
+                processInfo->searchedOffsetFromBase,
+                maxAllowedmoduleOffset);
 
         const uintptr_t requestedEnd = std::min(
             moduleEnd,
@@ -526,7 +675,6 @@ namespace WinProcHandling {
         MEMORY_BASIC_INFORMATION mbi{};
 
         uintptr_t seeker = requestedStart;
-
         while (seeker < requestedEnd) {
             if (VirtualQueryEx(
                     processInfo->handle,
@@ -536,36 +684,58 @@ namespace WinProcHandling {
                 return;
             }
 
-            const uintptr_t regionBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+            const uintptr_t regionBase =
+                reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+
             if (mbi.RegionSize == 0 ||
-                mbi.RegionSize > std::numeric_limits<uintptr_t>::max() - regionBase) {
+                mbi.RegionSize >
+                    std::numeric_limits<uintptr_t>::max() - regionBase) {
                 return;
             }
 
-            const uintptr_t regionEnd = regionBase + mbi.RegionSize;
-            const uintptr_t readBegin = std::max(requestedStart, regionBase);
-            const uintptr_t readEnd = std::min(requestedEnd, regionEnd);
+            const uintptr_t regionEnd =
+                regionBase + mbi.RegionSize;
 
-            if (readBegin >= readEnd) {
-                if (regionEnd <= seeker)
-                    return;
-                continue;
-            }
+            // The loop MUST make forward progress.
+            if (regionEnd <= seeker)
+                return;
 
-            if (mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD)) {
-                const bool readable = IsReadableProtection(mbi.Protect);
+            const uintptr_t readBegin =
+                std::max(requestedStart, regionBase);
 
-                for (uintptr_t current = readBegin; current < readEnd; ) {
-                    const SIZE_T remaining = static_cast<SIZE_T>(readEnd - current);
-                    const SIZE_T toRead = std::min<SIZE_T>(remaining, chunkSize);
+            const uintptr_t readEnd =
+                std::min(requestedEnd, regionEnd);
+
+            if (readBegin >= readEnd)
+                return;
+
+            if (mbi.State == MEM_COMMIT &&
+                !(mbi.Protect & PAGE_GUARD)) {
+
+                const bool readable =
+                    IsReadableProtection(mbi.Protect);
+
+                for (uintptr_t current = readBegin;
+                    current < readEnd; ) {
+
+                    const SIZE_T remaining =
+                        static_cast<SIZE_T>(readEnd - current);
+
+                    const SIZE_T toRead =
+                        std::min<SIZE_T>(
+                            remaining,
+                            chunkSize);
 
                     buffer.resize(toRead);
+
                     SIZE_T actuallyRead = 0;
                     DWORD oldProtect = 0;
                     bool changedProtection = false;
 
                     if (!readable) {
-                        const DWORD newProtection = ReadableProtection(mbi.Protect);
+                        const DWORD newProtection =
+                            ReadableProtection(mbi.Protect);
+
                         if (!VirtualProtectEx(
                                 processInfo->handle,
                                 reinterpret_cast<LPVOID>(current),
@@ -575,20 +745,20 @@ namespace WinProcHandling {
                             current += toRead;
                             continue;
                         }
+
                         changedProtection = true;
                     }
 
-                    const bool readSuccess =
-                        ReadProcessMemory(
-                            processInfo->handle,
-                            reinterpret_cast<LPCVOID>(current),
-                            buffer.data(),
-                            toRead,
-                            &actuallyRead) &&
-                        actuallyRead == toRead;
+                    (void)ReadProcessMemory(
+                        processInfo->handle,
+                        reinterpret_cast<LPCVOID>(current),
+                        buffer.data(),
+                        toRead,
+                        &actuallyRead);
 
                     if (changedProtection) {
                         DWORD ignored = 0;
+
                         (void)VirtualProtectEx(
                             processInfo->handle,
                             reinterpret_cast<LPVOID>(current),
@@ -597,21 +767,32 @@ namespace WinProcHandling {
                             &ignored);
                     }
 
-                    if (readSuccess) {
-                        for (SIZE_T byteOffset = 0; byteOffset < actuallyRead; ++byteOffset) {
-                            const size_t byteIndex =
-                                static_cast<size_t>(current - processInfo->moduleBase) + byteOffset;
-                            if (callback(callbackData, byteIndex, buffer[byteOffset]))
-                                return;
+                    // Deliver every byte that was actually transferred, even
+                    // when the chunk read completed only partially.
+                    const SIZE_T deliveredBytes =
+                        std::min<SIZE_T>(actuallyRead, toRead);
+
+                    for (SIZE_T byteOffset = 0;
+                        byteOffset < deliveredBytes;
+                        ++byteOffset) {
+
+                        const size_t byteIndex =
+                            static_cast<size_t>(
+                                current - processInfo->moduleBase) +
+                            byteOffset;
+
+                        if (callback(
+                                callbackData,
+                                byteIndex,
+                                buffer[byteOffset])) {
+                            return;
                         }
                     }
 
                     current += toRead;
                 }
             }
-
-            if (regionEnd <= seeker)
-                return;
+            seeker = regionEnd;
         }
     }
 
@@ -638,9 +819,10 @@ namespace WinProcHandling {
         const bool protectionRequested =
             virtualProtectMode != e_VirtualProtectMode::DontChange;
 
-        if (virtualProtectMode == e_VirtualProtectMode::SafelyChange ||
-            virtualProtectMode == e_VirtualProtectMode::ForceChange) {
-            if (!MakeLocalWritable(destination, size, changedPages)) {
+        if (protectionRequested) {
+            if (!MakeLocalWritable(
+                    destination, size, changedPages,
+                    virtualProtectMode == e_VirtualProtectMode::SafelyChange)) {
                 (void)RestoreLocal(changedPages, 0);
                 return e_WriteStatus::WriteMemoryFailed;
             }
@@ -762,9 +944,13 @@ namespace WinProcHandling {
         e_VirtualProtectMode virtualProtectMode,
         bool flushInstructionCache)
     {
+        // Handle is validated first so that remote overloads share one
+        // validation order with remote WriteMemory (see header notes).
+        if (!IsValidProcessHandle(processHandle))
+            return e_WriteStatus::WriteMemoryFailed;
         if (patchSize == 0)
             return e_WriteStatus::Success;
-        if (!IsValidProcessHandle(processHandle) || target == nullptr)
+        if (target == nullptr)
             return e_WriteStatus::WriteMemoryFailed;
 
         std::vector<uint8_t> nops(patchSize, 0x90);
@@ -793,7 +979,8 @@ namespace WinProcHandling {
 
         if (protectionRequested) {
             if (!MakeLocalReadable(
-                    const_cast<LPVOID>(source), size, changedPages)) {
+                    const_cast<LPVOID>(source), size, changedPages,
+                    virtualProtectMode == e_VirtualProtectMode::SafelyChange)) {
                 (void)RestoreLocal(changedPages, 0);
                 return false;
             }
